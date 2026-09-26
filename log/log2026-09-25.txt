@@ -1,0 +1,7 @@
+19:35:38 	Error: failed to stat config.ini, err=2
+19:35:39 	Error: failed to stat config.ini, err=2
+19:35:49 	Error: failed to stat config.ini, err=2
+19:50:43 	Error: failed to stat config.ini, err=2
+19:50:52 	Error: failed to stat config.ini, err=2
+19:50:53 	Error: failed to stat config.ini, err=2
+19:51:04 	Error: failed to stat config.ini, err=2
