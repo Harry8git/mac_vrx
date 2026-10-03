@@ -427,6 +427,7 @@ static int hevc_decoder_init(hevc_decoder_t *dec) {
     memset(dec, 0, sizeof(*dec));
     dec->codec = avcodec_find_decoder(AV_CODEC_ID_HEVC);
     if (!dec->codec) return -1;
+    av_log_set_level(AV_LOG_FATAL);
 
     dec->parser = av_parser_init(dec->codec->id);
     dec->ctx    = avcodec_alloc_context3(dec->codec);
@@ -450,6 +451,8 @@ static int hevc_decoder_init(hevc_decoder_t *dec) {
 }
 
 static void hevc_decoder_feed_chunk(hevc_decoder_t *dec, const uint8_t *data, int size) {
+    int frame_decoded = 0;
+
     while (size > 0 && !g_quit) {
         int consumed = av_parser_parse2(dec->parser, dec->ctx,
                                         &dec->pkt->data, &dec->pkt->size,
@@ -458,12 +461,33 @@ static void hevc_decoder_feed_chunk(hevc_decoder_t *dec, const uint8_t *data, in
         data += consumed;
         size -= consumed;
 
-        if (dec->pkt->size > 0) {
+        if (dec->pkt->data && dec->pkt->size > 0) {
+            frame_decoded = 1;
             if (avcodec_send_packet(dec->ctx, dec->pkt) == 0) {
                 while (avcodec_receive_frame(dec->ctx, dec->frame) == 0) {
                     metal_upload_yuv420p_frame(dec->frame);
                     av_frame_unref(dec->frame);
-                    /* Immediately draw to screen without waiting for display link */
+                    if (g_metal_view) {
+                        [g_metal_view renderFrame];
+                    }
+                }
+            }
+        }
+    }
+
+    /* Only flush if this chunk didn't yield a frame yet */
+    if (!frame_decoded && !g_quit) {
+        dec->pkt->data = NULL;
+        dec->pkt->size = 0;
+        av_parser_parse2(dec->parser, dec->ctx,
+                         &dec->pkt->data, &dec->pkt->size,
+                         NULL, 0, AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
+
+        if (dec->pkt->data && dec->pkt->size > 0) {
+            if (avcodec_send_packet(dec->ctx, dec->pkt) == 0) {
+                while (avcodec_receive_frame(dec->ctx, dec->frame) == 0) {
+                    metal_upload_yuv420p_frame(dec->frame);
+                    av_frame_unref(dec->frame);
                     if (g_metal_view) {
                         [g_metal_view renderFrame];
                     }
@@ -1001,3 +1025,7 @@ int main(int argc, char **argv) {
     }
     return 0;
 }
+
+
+// Before testing run:
+// v4l2-ctl -d /dev/v4l-subdev2 -c exposure=250,analogue_gain=35
