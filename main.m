@@ -571,7 +571,7 @@ static void *serial_thread_fn(void *arg) {
             last_physics_t = t;
         }
 
-        /* 50 Hz Outbound CRSF Frame */
+        /* Periodic CRSF Frame */
         if (t - last_tx_t >= (1.0 / CRSF_TX_HZ)) {
             last_tx_t = t;
             pthread_mutex_lock(&g_ctrl_lock);
