@@ -808,6 +808,7 @@ static void *video_thread_fn(void *arg) {
     layer.maximumDrawableCount = 2;
     /* BYPASS V-SYNC WAIT: Immediate scanout for lowest glass-to-glass latency */
     layer.displaySyncEnabled = NO;
+    //layer.opaque = YES;   // Tested
     self.metalLayer = layer;
     return layer;
 }
@@ -825,6 +826,8 @@ static void *video_thread_fn(void *arg) {
     id<CAMetalDrawable> drawable = [self.metalLayer nextDrawable];
     if (!drawable) return;
 
+    double t_render_start = CACurrentMediaTime();
+
     MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
     rpd.colorAttachments[0].texture = drawable.texture;
     rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
@@ -838,6 +841,19 @@ static void *video_thread_fn(void *arg) {
     [enc setFragmentTexture:v atIndex:2];
     [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
     [enc endEncoding];
+
+    /* PROBE: Exact hardware time when the MacBook display showed this frame */
+    [drawable addPresentedHandler:^(id<MTLDrawable> d) {
+        double t_presented = d.presentedTime;
+        if (t_presented > 0) {
+            double display_delay_ms = (t_presented - t_render_start) * 1000.0;
+            static int pres_cnt = 0;
+            if (++pres_cnt % 60 == 0) {
+                printf("[mac] Metal -> Screen Glass delay: %.2f ms\n", display_delay_ms);
+            }
+        }
+    }];
+
     [cmdBuf presentDrawable:drawable];
     [cmdBuf commit];
 }
@@ -983,7 +999,7 @@ int main(int argc, char **argv) {
         HUDOverlayView *hudView   = [[HUDOverlayView alloc] initWithFrame:metalView.bounds];
         metalView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
         hudView.autoresizingMask   = NSViewWidthSizable | NSViewHeightSizable;
-        [metalView addSubview:hudView];
+        [metalView addSubview:hudView];  // Tested
         [window setContentView:metalView];
         [window makeKeyAndOrderFront:nil];
         [NSApp activateIgnoringOtherApps:YES];
@@ -1025,7 +1041,3 @@ int main(int argc, char **argv) {
     }
     return 0;
 }
-
-
-// Before testing run:
-// v4l2-ctl -d /dev/v4l-subdev2 -c exposure=250,analogue_gain=35
