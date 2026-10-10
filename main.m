@@ -1021,7 +1021,7 @@ int main(int argc, char **argv) {
             " Switches:    1: MANUAL | 2: STABILIZE | 3: FBWA\n"
             " Safety:      Shift + Space -> Arm/Disarm\n"
             " Emergency:   R -> Toggle RTL\n"
-            " Display:     F -> Fullscreen | Q/Esc -> Exit\n"
+            " Display:     F -> Fullscreen | Esc -> Exit\n"
             " Target Port: %s\n\n", g_serial_dev_path);
 
         [NSApp run];
