@@ -474,27 +474,6 @@ static void hevc_decoder_feed_chunk(hevc_decoder_t *dec, const uint8_t *data, in
             }
         }
     }
-
-    /* Only flush if this chunk didn't yield a frame yet */
-    if (!frame_decoded && !g_quit) {
-        dec->pkt->data = NULL;
-        dec->pkt->size = 0;
-        av_parser_parse2(dec->parser, dec->ctx,
-                         &dec->pkt->data, &dec->pkt->size,
-                         NULL, 0, AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
-
-        if (dec->pkt->data && dec->pkt->size > 0) {
-            if (avcodec_send_packet(dec->ctx, dec->pkt) == 0) {
-                while (avcodec_receive_frame(dec->ctx, dec->frame) == 0) {
-                    metal_upload_yuv420p_frame(dec->frame);
-                    av_frame_unref(dec->frame);
-                    if (g_metal_view) {
-                        [g_metal_view renderFrame];
-                    }
-                }
-            }
-        }
-    }
 }
 
 static void hevc_decoder_destroy(hevc_decoder_t *dec) {
@@ -858,22 +837,46 @@ static void *video_thread_fn(void *arg) {
     [cmdBuf commit];
 }
 
-- (void)displayLinkDidFire:(CADisplayLink *)link {
-    (void)link;
-}
-
 @end
 
 @interface FullscreenWindow : NSWindow
 @property (nonatomic, assign) BOOL isFullscreen;
+@property (nonatomic, assign) BOOL cursorHidden;
 @property (nonatomic, assign) NSRect savedWindowedRect;
 - (void)toggleFullscreenMode;
+- (void)updateCursorVisibility;
 @end
 
 @implementation FullscreenWindow
 
 - (BOOL)canBecomeKeyWindow  { return YES; }
 - (BOOL)canBecomeMainWindow { return YES; }
+
+- (void)updateCursorVisibility {
+    if (self.isFullscreen && [self isKeyWindow]) {
+        if (!self.cursorHidden) {
+            [NSCursor hide];
+            self.cursorHidden = YES;
+        }
+    } else {
+        if (self.cursorHidden) {
+            [NSCursor unhide];
+            self.cursorHidden = NO;
+        }
+    }
+}
+
+- (void)becomeKeyWindow {
+    [super becomeKeyWindow];
+    [self updateCursorVisibility];
+}
+
+- (void)resignKeyWindow {
+    [super resignKeyWindow];
+    memset(&g_keys, 0, sizeof(g_keys));
+    /* Always show cursor when window loses focus (e.g., Cmd-Tab) */
+    [self updateCursorVisibility];
+}
 
 - (void)toggleFullscreenMode {
     if (self.isFullscreen) {
@@ -890,11 +893,7 @@ static void *video_thread_fn(void *arg) {
         self.isFullscreen = YES;
     }
     [self makeKeyAndOrderFront:nil];
-}
-
-- (void)resignKeyWindow {
-    [super resignKeyWindow];
-    memset(&g_keys, 0, sizeof(g_keys));
+    [self updateCursorVisibility];
 }
 
 - (void)keyDown:(NSEvent *)event {
@@ -941,7 +940,7 @@ static void *video_thread_fn(void *arg) {
 
         case kVK_ANSI_C:       ctrl_center(); break;
         case kVK_ANSI_F:       [self toggleFullscreenMode]; break;
-        case kVK_ANSI_Q: case kVK_Escape:
+        case kVK_Escape:
             g_quit = 1;
             [NSApp stop:nil];
             break;
@@ -1003,13 +1002,6 @@ int main(int argc, char **argv) {
         [window setContentView:metalView];
         [window makeKeyAndOrderFront:nil];
         [NSApp activateIgnoringOtherApps:YES];
-
-        CADisplayLink *displayLink = [metalView displayLinkWithTarget:metalView selector:@selector(displayLinkDidFire:)];
-
-        /* UNLOCK 120Hz ProMotion: Cuts presentation interval from 16.6ms down to 8.3ms */
-        displayLink.preferredFrameRateRange = CAFrameRateRangeMake(120, 120, 120);
-
-        [displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
         
         [NSTimer scheduledTimerWithTimeInterval:0.016 repeats:YES block:^(NSTimer *timer) {
             (void)timer;
@@ -1035,7 +1027,6 @@ int main(int argc, char **argv) {
         [NSApp run];
 
         g_quit = 1;
-        [displayLink invalidate];
         pthread_join(video_tid, NULL);
         pthread_join(serial_tid, NULL);
     }
