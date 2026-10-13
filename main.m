@@ -1,6 +1,7 @@
 /*
- * High-Speed USB Bulk Video Receiver (VRX) + Keyboard Plane Control +
- * ArduPilot CRSF Telemetry & HUD, for macOS.
+ * High-Speed USB Bulk Video Receiver (VRX) + Telemetry HUD
+ * Ultra-Low Latency Pipeline with Non-blocking Metal Presentation
+ * Pure P-frame / Immediate Access Unit Ingest
  */
 
 #define _DARWIN_C_SOURCE
@@ -36,6 +37,7 @@
 #define TARGET_VID              0x2207
 #define TARGET_PID              0x0011
 #define BUFFER_SIZE             (64 * 1024)
+#define MAX_AU_PAYLOAD          (2 * 1024 * 1024)
 
 /* ---------------- ArduPilot CRSF link config ---------------- */
 #define ARDUPILOT_SERIAL_DEV_DEFAULT "/dev/cu.usbmodem14201"
@@ -52,10 +54,10 @@
 #define CRSF_FRAMETYPE_ATTITUDE 0x1E
 #define CRSF_FRAMETYPE_FLIGHT_MODE 0x21
 
-#define DECAY_TAU_SEC           0.35f   /* Spring-back decay time constant */
-#define THROTTLE_RATE           0.50f   /* 0 to 100% in 2.0s */
+#define DECAY_TAU_SEC           0.35f
+#define THROTTLE_RATE           0.50f
 
-#define SHOW_LATENCY_TIMER  1   /* Set to 0 when you are done measuring latency */
+#define SHOW_LATENCY_TIMER      1
 
 /* ---------------- Embedded Metal Shader Source -------------- */
 static const char *kMetalShaderSource =
@@ -202,14 +204,14 @@ static float clampf(float v, float lo, float hi) {
 
 /* --- Pilot Controls --- */
 typedef struct {
-    float roll, pitch, yaw;   /* -1..+1, spring-centered */
-    float throttle;           /*  0..+1, holding/latching */
-    bool  armed;              /* CH5: Arm/Disarm */
-    bool  rtl;                /* CH7: RTL */
-    int   flight_mode;        /* CH8: 1=MAN, 2=STAB, 3=FBWA */
+    float roll, pitch, yaw;
+    float throttle;
+    bool  armed;
+    bool  rtl;
+    int   flight_mode;
 } ctrl_state_t;
 
-static ctrl_state_t   g_ctrl = { .flight_mode = 1 };
+static ctrl_state_t    g_ctrl = { .flight_mode = 1 };
 static pthread_mutex_t g_ctrl_lock = PTHREAD_MUTEX_INITIALIZER;
 
 typedef struct {
@@ -243,7 +245,6 @@ typedef struct {
 static telem_data_t    g_telem = { .flight_mode = "MANUAL" };
 static pthread_mutex_t g_telem_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* Telemetry cache helpers (clean snapshotting without copying mutexes) */
 static telem_data_t telem_get_snapshot(void) {
     pthread_mutex_lock(&g_telem_lock);
     telem_data_t snap = g_telem;
@@ -258,7 +259,7 @@ static void ctrl_center(void) {
 }
 
 /* ================================================================
- * CRSF Encoding & Decoding
+ * CRSF Protocol Handling
  * ================================================================ */
 static uint16_t encode_axis(float v) {
     int raw = 992 + (int)(v * 820.0f);
@@ -299,14 +300,14 @@ static void crsf_pack_channels(const uint16_t ch[16], uint8_t out[22]) {
 
 static int crsf_build_rc_frame(ctrl_state_t s, uint8_t out[26]) {
     uint16_t ch[16];
-    ch[0] = encode_axis(s.roll);          /* CH1: Roll */
-    ch[1] = encode_axis(s.pitch);         /* CH2: Pitch */
-    ch[2] = encode_throttle(s.throttle);  /* CH3: Throttle */
-    ch[3] = encode_axis(s.yaw);           /* CH4: Yaw */
-    ch[4] = s.armed ? 1811 : 172;         /* CH5: Arm/Disarm */
-    ch[5] = 992;                          /* CH6: Spare */
-    ch[6] = s.rtl ? 1811 : 172;           /* CH7: RTL */
-    ch[7] = (s.flight_mode == 1) ? 172 : ((s.flight_mode == 2) ? 992 : 1811); /* CH8: 3-Pos Mode */
+    ch[0] = encode_axis(s.roll);
+    ch[1] = encode_axis(s.pitch);
+    ch[2] = encode_throttle(s.throttle);
+    ch[3] = encode_axis(s.yaw);
+    ch[4] = s.armed ? 1811 : 172;
+    ch[5] = 992;
+    ch[6] = s.rtl ? 1811 : 172;
+    ch[7] = (s.flight_mode == 1) ? 172 : ((s.flight_mode == 2) ? 992 : 1811);
     for (int i = 8; i < 16; i++) ch[i] = 992;
 
     out[0] = CRSF_SYNC_FC;
@@ -322,7 +323,7 @@ static int crsf_build_link_stats_frame(uint8_t out[14]) {
     out[1] = 10 + 2;
     out[2] = CRSF_FRAMETYPE_LINK_STAT;
     out[3] = 45; out[4] = 45; out[5] = 100; out[6] = 10;
-    out[7] = 0;  out[8] = 2;  /* 150Hz telemetry unlock */
+    out[7] = 0;  out[8] = 2;
     out[9] = 0;  out[10] = 45; out[11] = 100; out[12] = 10;
     out[13] = crsf_crc8(&out[2], 1 + 10);
     return 14;
@@ -342,7 +343,6 @@ static void handle_crsf_frame(const uint8_t *f, int len) {
             g_telem.yaw_deg   = (int16_t)((payload[4] << 8) | payload[5]) / 10000.0f * 180.0f / (float)M_PI;
         }
         break;
-
     case CRSF_FRAMETYPE_BATTERY:
         if (payload_len >= 8) {
             g_telem.voltage     = (uint16_t)((payload[0] << 8) | payload[1]) / 10.0f;
@@ -351,7 +351,6 @@ static void handle_crsf_frame(const uint8_t *f, int len) {
             g_telem.battery_pct = payload[7];
         }
         break;
-
     case CRSF_FRAMETYPE_GPS:
         if (payload_len >= 15) {
             int32_t lat = (int32_t)((payload[0] << 24) | (payload[1] << 16) | (payload[2] << 8) | payload[3]);
@@ -363,7 +362,6 @@ static void handle_crsf_frame(const uint8_t *f, int len) {
             g_telem.sats            = payload[14];
         }
         break;
-
     case CRSF_FRAMETYPE_FLIGHT_MODE: {
         int n = payload_len < 15 ? payload_len : 15;
         if (n > 0) {
@@ -372,7 +370,6 @@ static void handle_crsf_frame(const uint8_t *f, int len) {
         }
         break;
     }
-
     case CRSF_FRAMETYPE_LINK_STAT:
         if (payload_len >= 4) {
             g_telem.rssi = (int8_t)payload[0];
@@ -413,14 +410,13 @@ static void crsf_parser_feed(crsf_parser_t *p, uint8_t byte) {
 }
 
 /* ================================================================
- * Video Decoder Context (Low-Latency HEVC)
+ * Video Decoder Context (Zero-Latency HEVC)
  * ================================================================ */
 typedef struct {
-    const AVCodec        *codec;
-    AVCodecContext       *ctx;
-    AVCodecParserContext *parser;
-    AVFrame              *frame;
-    AVPacket             *pkt;
+    const AVCodec  *codec;
+    AVCodecContext *ctx;
+    AVFrame        *frame;
+    AVPacket       *pkt;
 } hevc_decoder_t;
 
 static int hevc_decoder_init(hevc_decoder_t *dec) {
@@ -429,16 +425,16 @@ static int hevc_decoder_init(hevc_decoder_t *dec) {
     if (!dec->codec) return -1;
     av_log_set_level(AV_LOG_FATAL);
 
-    dec->parser = av_parser_init(dec->codec->id);
-    dec->ctx    = avcodec_alloc_context3(dec->codec);
-    if (!dec->parser || !dec->ctx) return -1;
+    dec->ctx = avcodec_alloc_context3(dec->codec);
+    if (!dec->ctx) return -1;
 
-    dec->ctx->flags  |= AV_CODEC_FLAG_LOW_DELAY;
-    dec->ctx->flags2 |= AV_CODEC_FLAG2_FAST;
-    dec->ctx->thread_type = 0;
+    dec->ctx->flags  |= AV_CODEC_FLAG_LOW_DELAY | AV_CODEC_FLAG_OUTPUT_CORRUPT;
+    dec->ctx->flags2 |= AV_CODEC_FLAG2_FAST | AV_CODEC_FLAG2_SHOW_ALL;
+    dec->ctx->thread_type  = 0;
     dec->ctx->thread_count = 1;
     dec->ctx->max_b_frames = 0;
-    dec->ctx->delay = 0;
+    dec->ctx->has_b_frames = 0;
+    dec->ctx->delay        = 0;
 
     AVDictionary *opts = NULL;
     av_dict_set(&opts, "tune", "zerolatency", 0);
@@ -450,37 +446,206 @@ static int hevc_decoder_init(hevc_decoder_t *dec) {
     return (dec->frame && dec->pkt) ? 0 : -1;
 }
 
-static void hevc_decoder_feed_chunk(hevc_decoder_t *dec, const uint8_t *data, int size) {
-    int frame_decoded = 0;
+static void hevc_decoder_destroy(hevc_decoder_t *dec) {
+    if (dec->frame) av_frame_free(&dec->frame);
+    if (dec->pkt)   av_packet_free(&dec->pkt);
+    if (dec->ctx)   avcodec_free_context(&dec->ctx);
+}
 
-    while (size > 0 && !g_quit) {
-        int consumed = av_parser_parse2(dec->parser, dec->ctx,
-                                        &dec->pkt->data, &dec->pkt->size,
-                                        data, size, AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
-        if (consumed < 0) break;
-        data += consumed;
-        size -= consumed;
+/* ================================================================
+ * Decoupled Strict FIFO Queue & Decoder/Render Worker Thread
+ * ================================================================ */
+#define QUEUE_CAP 8
 
-        if (dec->pkt->data && dec->pkt->size > 0) {
-            frame_decoded = 1;
-            if (avcodec_send_packet(dec->ctx, dec->pkt) == 0) {
-                while (avcodec_receive_frame(dec->ctx, dec->frame) == 0) {
-                    metal_upload_yuv420p_frame(dec->frame);
-                    av_frame_unref(dec->frame);
-                    if (g_metal_view) {
-                        [g_metal_view renderFrame];
-                    }
+typedef struct {
+    uint8_t  data[MAX_AU_PAYLOAD + AV_INPUT_BUFFER_PADDING_SIZE];
+    uint32_t len;
+} au_slot_t;
+
+static au_slot_t       g_queue[QUEUE_CAP];
+static int             g_q_head = 0;
+static int             g_q_tail = 0;
+static int             g_q_count = 0;
+static pthread_mutex_t g_q_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_q_cond = PTHREAD_COND_INITIALIZER;
+
+static uint64_t g_pkt_no, g_frame_no;
+static double   g_t0;
+static double   g_sum_dec, g_sum_up, g_sum_rend, g_max_rend, g_sum_nd;
+
+static void *decode_render_thread_fn(void *arg) {
+    (void)arg;
+    hevc_decoder_t dec;
+    if (hevc_decoder_init(&dec) != 0) {
+        fprintf(stderr, "[decode] Failed to initialize HEVC decoder\n");
+        return NULL;
+    }
+    fprintf(stderr, "[decode] Decoder & Render worker thread active\n");
+
+    while (!g_quit) {
+        pthread_mutex_lock(&g_q_lock);
+        while (g_q_count == 0 && !g_quit) {
+            pthread_cond_wait(&g_q_cond, &g_q_lock);
+        }
+        if (g_quit) {
+            pthread_mutex_unlock(&g_q_lock);
+            break;
+        }
+
+        /* Pop in strict order: NEVER skip a P-frame */
+        int pop_idx = g_q_tail;
+        g_q_tail = (g_q_tail + 1) % QUEUE_CAP;
+        g_q_count--;
+        pthread_mutex_unlock(&g_q_lock);
+
+        au_slot_t *slot = &g_queue[pop_idx];
+        memset(slot->data + slot->len, 0, AV_INPUT_BUFFER_PADDING_SIZE);
+        dec.pkt->data = slot->data;
+        dec.pkt->size = slot->len;
+        g_pkt_no++;
+
+        double t0 = now_seconds();
+        int sret = avcodec_send_packet(dec.ctx, dec.pkt);
+        if (sret == 0) {
+            while (avcodec_receive_frame(dec.ctx, dec.frame) == 0) {
+                double t1 = now_seconds();
+                metal_upload_yuv420p_frame(dec.frame);
+                double t2 = now_seconds();
+                av_frame_unref(dec.frame);
+
+                if (g_metal_view) {
+                    [g_metal_view renderFrame];
+                }
+                double t3 = now_seconds();
+
+                g_frame_no++;
+                g_sum_dec  += (t1 - t0) * 1e3;
+                g_sum_up   += (t2 - t1) * 1e3;
+                g_sum_rend += (t3 - t2) * 1e3;
+                if ((t3 - t2) * 1e3 > g_max_rend) g_max_rend = (t3 - t2) * 1e3;
+
+                if (g_frame_no % 120 == 0) {
+                    fprintf(stderr, "[stats] aus=%llu frames=%llu | decode %.2f ms, upload %.2f ms, "
+                            "render-submit avg %.2f / max %.2f ms (nextDrawable %.2f ms)\n",
+                            g_pkt_no, g_frame_no, g_sum_dec / 120, g_sum_up / 120,
+                            g_sum_rend / 120, g_max_rend, g_sum_nd / 120);
+                    g_sum_dec = g_sum_up = g_sum_rend = g_max_rend = g_sum_nd = 0;
+                }
+            }
+        }
+        dec.pkt->data = NULL;
+        dec.pkt->size = 0;
+    }
+
+    hevc_decoder_destroy(&dec);
+    return NULL;
+}
+
+/* ================================================================
+ * Video Thread: High-Speed Dedicated USB Ingest
+ * ================================================================ */
+static bool find_bulk_in_endpoint(libusb_device *dev, int *out_intf, uint8_t *out_ep) {
+    struct libusb_config_descriptor *config = NULL;
+    if (libusb_get_active_config_descriptor(dev, &config) < 0) return false;
+
+    bool found = false;
+    for (int i = 0; i < config->bNumInterfaces && !found; i++) {
+        const struct libusb_interface *intf = &config->interface[i];
+        for (int a = 0; a < intf->num_altsetting && !found; a++) {
+            const struct libusb_interface_descriptor *alt = &intf->altsetting[a];
+            if (alt->bInterfaceClass != LIBUSB_CLASS_VENDOR_SPEC) continue;
+
+            for (int e = 0; e < alt->bNumEndpoints; e++) {
+                const struct libusb_endpoint_descriptor *ep = &alt->endpoint[e];
+                bool is_in = (ep->bEndpointAddress & LIBUSB_ENDPOINT_DIR_MASK) == LIBUSB_ENDPOINT_IN;
+                bool is_bulk = (ep->bmAttributes & LIBUSB_TRANSFER_TYPE_MASK) == LIBUSB_TRANSFER_TYPE_BULK;
+                if (is_in && is_bulk) {
+                    *out_intf = alt->bInterfaceNumber;
+                    *out_ep   = ep->bEndpointAddress;
+                    found = true;
+                    break;
                 }
             }
         }
     }
+    libusb_free_config_descriptor(config);
+    return found;
 }
 
-static void hevc_decoder_destroy(hevc_decoder_t *dec) {
-    if (dec->frame)  av_frame_free(&dec->frame);
-    if (dec->pkt)    av_packet_free(&dec->pkt);
-    if (dec->ctx)    avcodec_free_context(&dec->ctx);
-    if (dec->parser) av_parser_close(dec->parser);
+/* ================================================================
+ * Video Thread: Dedicated High-Speed USB Ingest
+ * ================================================================ */
+static void *video_thread_fn(void *arg) {
+    (void)arg;
+    libusb_context *ctx = NULL;
+    if (libusb_init(&ctx) < 0) return NULL;
+
+    uint8_t *usb_buffer = malloc(BUFFER_SIZE);
+
+    pthread_t dec_tid;
+    pthread_create(&dec_tid, NULL, decode_render_thread_fn, NULL);
+
+    while (!g_quit) {
+        libusb_device_handle *dev = libusb_open_device_with_vid_pid(ctx, TARGET_VID, TARGET_PID);
+        if (!dev) {
+            usleep(200 * 1000);
+            continue;
+        }
+
+        int target_intf = -1;
+        uint8_t ep_in_addr = 0;
+        if (!find_bulk_in_endpoint(libusb_get_device(dev), &target_intf, &ep_in_addr)) {
+            libusb_close(dev);
+            usleep(500 * 1000);
+            continue;
+        }
+
+        libusb_detach_kernel_driver(dev, target_intf);
+        if (libusb_claim_interface(dev, target_intf) < 0) {
+            libusb_close(dev);
+            usleep(500 * 1000);
+            continue;
+        }
+
+        fprintf(stderr, "[video] Connected! EP 0x%02X streaming\n", ep_in_addr);
+
+        while (!g_quit) {
+            int actual = 0;
+            int ret = libusb_bulk_transfer(dev, ep_in_addr, usb_buffer, BUFFER_SIZE, &actual, 100);
+
+            if (ret == 0 && actual > 0) {
+                if (g_t0 == 0) g_t0 = now_seconds();
+
+                pthread_mutex_lock(&g_q_lock);
+                if (g_q_count < QUEUE_CAP) {
+                    memcpy(g_queue[g_q_head].data, usb_buffer, actual);
+                    g_queue[g_q_head].len = actual;
+                    g_q_head = (g_q_head + 1) % QUEUE_CAP;
+                    g_q_count++;
+                    pthread_cond_signal(&g_q_cond);
+                } else {
+                    /* Queue overflow: print a warning so we see if host fell behind */
+                    fprintf(stderr, "[warn] FIFO full! Dropped frame\n");
+                }
+                pthread_mutex_unlock(&g_q_lock);
+
+            } else if (ret == LIBUSB_ERROR_NO_DEVICE || ret == LIBUSB_ERROR_IO) {
+                fprintf(stderr, "[video] Device disconnected\n");
+                break;
+            }
+        }
+
+        libusb_release_interface(dev, target_intf);
+        libusb_close(dev);
+    }
+
+    g_quit = 1;
+    pthread_cond_broadcast(&g_q_cond);
+    pthread_join(dec_tid, NULL);
+
+    free(usb_buffer);
+    libusb_exit(ctx);
+    return NULL;
 }
 
 /* ================================================================
@@ -517,7 +682,6 @@ static void *serial_thread_fn(void *arg) {
             fprintf(stderr, "[serial] Connected to %s\n", g_serial_dev_path);
         }
 
-        /* Read incoming telemetry */
         uint8_t rx_buf[256];
         ssize_t n;
         while ((n = read(fd, rx_buf, sizeof(rx_buf))) > 0) {
@@ -529,7 +693,6 @@ static void *serial_thread_fn(void *arg) {
             continue;
         }
 
-        /* 100 Hz Proportional Decay Physics Engine */
         double t = now_seconds();
         double dt = t - last_physics_t;
         if (dt >= 0.01) {
@@ -550,7 +713,6 @@ static void *serial_thread_fn(void *arg) {
             last_physics_t = t;
         }
 
-        /* Periodic CRSF Frame */
         if (t - last_tx_t >= (1.0 / CRSF_TX_HZ)) {
             last_tx_t = t;
             pthread_mutex_lock(&g_ctrl_lock);
@@ -562,7 +724,6 @@ static void *serial_thread_fn(void *arg) {
             write(fd, tx_frame, len);
         }
 
-        /* 10 Hz Link Statistics keep-alive */
         if (t - last_link_t >= 0.1) {
             last_link_t = t;
             uint8_t link_frame[14];
@@ -577,117 +738,8 @@ static void *serial_thread_fn(void *arg) {
     return NULL;
 }
 
-
-
-/* Search descriptors strictly for a Vendor-Specific Bulk IN endpoint */
-static bool find_bulk_in_endpoint(libusb_device *dev, int *out_intf, uint8_t *out_ep) {
-    struct libusb_config_descriptor *config = NULL;
-    if (libusb_get_active_config_descriptor(dev, &config) < 0) {
-        return false;
-    }
-
-    bool found = false;
-    for (int i = 0; i < config->bNumInterfaces && !found; i++) {
-        const struct libusb_interface *intf = &config->interface[i];
-        for (int a = 0; a < intf->num_altsetting && !found; a++) {
-            const struct libusb_interface_descriptor *alt = &intf->altsetting[a];
-
-            /* CRITICAL: Only match Vendor-Specific class (0xFF) to ignore CDC-ACM serial */
-            if (alt->bInterfaceClass != LIBUSB_CLASS_VENDOR_SPEC) {
-                continue;
-            }
-
-            for (int e = 0; e < alt->bNumEndpoints; e++) {
-                const struct libusb_endpoint_descriptor *ep = &alt->endpoint[e];
-                bool is_in = (ep->bEndpointAddress & LIBUSB_ENDPOINT_DIR_MASK) == LIBUSB_ENDPOINT_IN;
-                bool is_bulk = (ep->bmAttributes & LIBUSB_TRANSFER_TYPE_MASK) == LIBUSB_TRANSFER_TYPE_BULK;
-
-                if (is_in && is_bulk) {
-                    *out_intf = alt->bInterfaceNumber;
-                    *out_ep   = ep->bEndpointAddress;
-                    found = true;
-                    break;
-                }
-            }
-        }
-    }
-
-    libusb_free_config_descriptor(config);
-    return found;
-}
-
-
-
 /* ================================================================
- * Video Thread: Bulk USB Ingest
- * ================================================================ */
-static void *video_thread_fn(void *arg) {
-    (void)arg;
-    libusb_context *ctx = NULL;
-    if (libusb_init(&ctx) < 0) return NULL;
-
-    hevc_decoder_t dec;
-    if (hevc_decoder_init(&dec) != 0) {
-        libusb_exit(ctx);
-        return NULL;
-    }
-
-    uint8_t *usb_buffer = malloc(BUFFER_SIZE);
-
-    while (!g_quit) {
-        libusb_device_handle *dev = libusb_open_device_with_vid_pid(ctx, TARGET_VID, TARGET_PID);
-        if (!dev) {
-            usleep(250 * 1000);
-            continue;
-        }
-
-        /* --- Dynamic Descriptor Lookup --- */
-        int target_intf = -1;
-        uint8_t ep_in_addr = 0;
-        if (!find_bulk_in_endpoint(libusb_get_device(dev), &target_intf, &ep_in_addr)) {
-            fprintf(stderr, "[video] Could not find Bulk IN endpoint on USB device!\n");
-            libusb_close(dev);
-            usleep(1000 * 1000);
-            continue;
-        }
-
-        /* Detach OS kernel driver if macOS assigned a default driver */
-        libusb_detach_kernel_driver(dev, target_intf);
-
-        if (libusb_claim_interface(dev, target_intf) < 0) {
-            fprintf(stderr, "[video] Failed to claim interface %d\n", target_intf);
-            libusb_close(dev);
-            usleep(500 * 1000);
-            continue;
-        }
-
-        fprintf(stderr, "[video] Connected! Claimed interface %d, streaming endpoint 0x%02X\n",
-                target_intf, ep_in_addr);
-
-        while (!g_quit) {
-            int actual = 0;
-            /* Use the discovered ep_in_addr instead of hardcoded 0x81 */
-            int ret = libusb_bulk_transfer(dev, ep_in_addr, usb_buffer, BUFFER_SIZE, &actual, 100);
-            if (ret == 0 && actual > 0) {
-                hevc_decoder_feed_chunk(&dec, usb_buffer, actual);
-            } else if (ret == LIBUSB_ERROR_NO_DEVICE || ret == LIBUSB_ERROR_IO) {
-                fprintf(stderr, "[video] Device disconnected\n");
-                break;
-            }
-        }
-
-        libusb_release_interface(dev, target_intf);
-        libusb_close(dev);
-    }
-
-    free(usb_buffer);
-    hevc_decoder_destroy(&dec);
-    libusb_exit(ctx);
-    return NULL;
-}
-
-/* ================================================================
- * HUD Overlay View (Horizon, Bat, GPS, Alt, Speed, Throttle)
+ * HUD Overlay View
  * ================================================================ */
 @interface HUDOverlayView : NSView
 @end
@@ -724,7 +776,7 @@ static void *video_thread_fn(void *arg) {
     CGContextStrokePath(ctx);
     CGContextRestoreGState(ctx);
 
-    /* 2. Left Side: Throttle Indicator */
+    /* 2. Throttle Bar */
     CGFloat thH = 200.0, thW = 12.0, thX = 40.0, thY = (h - thH) * 0.5;
     CGContextSetStrokeColorWithColor(ctx, [NSColor whiteColor].CGColor);
     CGContextStrokeRect(ctx, CGRectMake(thX, thY, thW, thH));
@@ -737,7 +789,6 @@ static void *video_thread_fn(void *arg) {
         NSForegroundColorAttributeName: [NSColor colorWithCalibratedRed:0.0 green:1.0 blue:0.4 alpha:0.95]
     };
 
-    /* Top Banner: Mode, Arm Status, Signal */
     NSString *osdTop = [NSString stringWithFormat:@"%s [%s]  %s   LQ: %u%%  RSSI: -%ddBm",
                         telem.flight_mode,
                         ctrl.rtl ? "RTL-ACTIVE" : (ctrl.flight_mode == 1 ? "MAN" : (ctrl.flight_mode == 2 ? "STAB" : "FBWA")),
@@ -746,19 +797,16 @@ static void *video_thread_fn(void *arg) {
     [osdTop drawAtPoint:CGPointMake(40, h - 35) withAttributes:attrGreen];
 
 #if SHOW_LATENCY_TIMER
-    /* 4-digit rollover stopwatch (0000 to 9999 ms) in the top-right corner */
-    NSString *timerStr = [NSString stringWithFormat:@"%04u ms", 
+    NSString *timerStr = [NSString stringWithFormat:@"%04u ms",
                           (uint32_t)((uint64_t)(now_seconds() * 1000.0) % 10000)];
     CGSize timerSize = [timerStr sizeWithAttributes:attrGreen];
     [timerStr drawAtPoint:CGPointMake(w - timerSize.width - 40, h - 35) withAttributes:attrGreen];
 #endif
 
-    /* Bottom Left: Power & Motor */
     NSString *osdPower = [NSString stringWithFormat:@"BAT: %4.1fV %4.1fA (%u%%) %u mAh   THR: %3d%%",
                           telem.voltage, telem.current, telem.battery_pct, telem.mah, (int)(ctrl.throttle * 100.0f)];
     [osdPower drawAtPoint:CGPointMake(40, 20) withAttributes:attrGreen];
 
-    /* Bottom Right: GPS & Navigation */
     NSString *osdNav = [NSString stringWithFormat:@"ALT: %4.0fm  SPD: %3.0fkm/h  SATS: %2u  LAT: %9.5f LON: %9.5f",
                         telem.altitude_m, telem.groundspeed_kmh, telem.sats, telem.latitude, telem.longitude];
     CGSize navSize = [osdNav sizeWithAttributes:attrGreen];
@@ -768,9 +816,8 @@ static void *video_thread_fn(void *arg) {
 @end
 
 /* ================================================================
- * Metal Presentation & Application Setup
+ * Metal Presentation
  * ================================================================ */
-
 @implementation FPVMetalView
 
 - (instancetype)initWithFrame:(NSRect)frameRect {
@@ -784,10 +831,11 @@ static void *video_thread_fn(void *arg) {
     layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
     layer.framebufferOnly = YES;
     layer.presentsWithTransaction = NO;
-    layer.maximumDrawableCount = 2;
-    /* BYPASS V-SYNC WAIT: Immediate scanout for lowest glass-to-glass latency */
+
+    /* TRIPLE BUFFERING: Prevents nextDrawable from blocking on display refresh */
+    layer.maximumDrawableCount = 3;
     layer.displaySyncEnabled = NO;
-    //layer.opaque = YES;   // Tested
+
     self.metalLayer = layer;
     return layer;
 }
@@ -802,7 +850,9 @@ static void *video_thread_fn(void *arg) {
     id<MTLTexture> y = g_metal.yTex[idx], u = g_metal.uTex[idx], v = g_metal.vTex[idx];
     pthread_mutex_unlock(&g_metal.tex_lock);
 
+    double t_nd0 = CACurrentMediaTime();
     id<CAMetalDrawable> drawable = [self.metalLayer nextDrawable];
+    g_sum_nd += (CACurrentMediaTime() - t_nd0) * 1000.0;
     if (!drawable) return;
 
     double t_render_start = CACurrentMediaTime();
@@ -821,7 +871,6 @@ static void *video_thread_fn(void *arg) {
     [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
     [enc endEncoding];
 
-    /* PROBE: Exact hardware time when the MacBook display showed this frame */
     [drawable addPresentedHandler:^(id<MTLDrawable> d) {
         double t_presented = d.presentedTime;
         if (t_presented > 0) {
@@ -839,6 +888,9 @@ static void *video_thread_fn(void *arg) {
 
 @end
 
+/* ================================================================
+ * Window & App Setup
+ * ================================================================ */
 @interface FullscreenWindow : NSWindow
 @property (nonatomic, assign) BOOL isFullscreen;
 @property (nonatomic, assign) BOOL cursorHidden;
@@ -874,7 +926,6 @@ static void *video_thread_fn(void *arg) {
 - (void)resignKeyWindow {
     [super resignKeyWindow];
     memset(&g_keys, 0, sizeof(g_keys));
-    /* Always show cursor when window loses focus (e.g., Cmd-Tab) */
     [self updateCursorVisibility];
 }
 
@@ -901,19 +952,16 @@ static void *video_thread_fn(void *arg) {
     unsigned short code = [event keyCode];
 
     switch (code) {
-        /* Left Hand: Throttle & Rudder */
         case kVK_ANSI_W:       g_keys.throttle_up   = true; break;
         case kVK_ANSI_S:       g_keys.throttle_down = true; break;
         case kVK_ANSI_A:       g_keys.yaw_left      = true; break;
         case kVK_ANSI_D:       g_keys.yaw_right     = true; break;
 
-        /* Right Hand: Pitch & Roll */
         case kVK_UpArrow:      g_keys.pitch_down    = true; break;
         case kVK_DownArrow:    g_keys.pitch_up      = true; break;
         case kVK_LeftArrow:    g_keys.roll_left     = true; break;
         case kVK_RightArrow:   g_keys.roll_right    = true; break;
 
-        /* Modes: 1=MAN, 2=STAB, 3=FBWA */
         case kVK_ANSI_1: case kVK_ANSI_2: case kVK_ANSI_3: {
             pthread_mutex_lock(&g_ctrl_lock);
             g_ctrl.flight_mode = (code == kVK_ANSI_1) ? 1 : ((code == kVK_ANSI_2) ? 2 : 3);
@@ -921,7 +969,6 @@ static void *video_thread_fn(void *arg) {
             break;
         }
 
-        /* Emergency RTL */
         case kVK_ANSI_R: {
             pthread_mutex_lock(&g_ctrl_lock);
             g_ctrl.rtl = !g_ctrl.rtl;
@@ -929,7 +976,6 @@ static void *video_thread_fn(void *arg) {
             break;
         }
 
-        /* Arming: Shift + Space */
         case kVK_Space:
             if ([event modifierFlags] & NSEventModifierFlagShift) {
                 pthread_mutex_lock(&g_ctrl_lock);
@@ -994,15 +1040,19 @@ int main(int argc, char **argv) {
         window.savedWindowedRect = NSMakeRect(100, 100, 1280, 720);
 
         FPVMetalView *metalView = [[FPVMetalView alloc] initWithFrame:screenRect];
-        g_metal_view = metalView; /* Store for immediate presentation */
-        HUDOverlayView *hudView   = [[HUDOverlayView alloc] initWithFrame:metalView.bounds];
+        g_metal_view = metalView;
+        HUDOverlayView *hudView = [[HUDOverlayView alloc] initWithFrame:metalView.bounds];
         metalView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
         hudView.autoresizingMask   = NSViewWidthSizable | NSViewHeightSizable;
-        [metalView addSubview:hudView];  // Tested
+
+        if (!getenv("NOHUD")) [metalView addSubview:hudView];
+        fprintf(stderr, "[mac] screen max refresh: %ld Hz\n",
+                (long)[[NSScreen mainScreen] maximumFramesPerSecond]);
+
         [window setContentView:metalView];
         [window makeKeyAndOrderFront:nil];
         [NSApp activateIgnoringOtherApps:YES];
-        
+
         [NSTimer scheduledTimerWithTimeInterval:0.016 repeats:YES block:^(NSTimer *timer) {
             (void)timer;
             [hudView setNeedsDisplay:YES];
@@ -1016,13 +1066,7 @@ int main(int argc, char **argv) {
             "\n==================================================\n"
             " ArduPilot FPV Controller & Metal HUD Ready \n"
             "==================================================\n"
-            " Left Hand:   W/S -> Throttle | A/D -> Rudder\n"
-            " Right Hand:  Up/Down -> Pitch | Left/Right -> Roll\n"
-            " Switches:    1: MANUAL | 2: STABILIZE | 3: FBWA\n"
-            " Safety:      Shift + Space -> Arm/Disarm\n"
-            " Emergency:   R -> Toggle RTL\n"
-            " Display:     F -> Fullscreen | Esc -> Exit\n"
-            " Target Port: %s\n\n", g_serial_dev_path);
+            " Port: %s\n\n", g_serial_dev_path);
 
         [NSApp run];
 
