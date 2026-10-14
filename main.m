@@ -413,10 +413,11 @@ static void crsf_parser_feed(crsf_parser_t *p, uint8_t byte) {
  * Video Decoder Context (Zero-Latency HEVC)
  * ================================================================ */
 typedef struct {
-    const AVCodec  *codec;
-    AVCodecContext *ctx;
-    AVFrame        *frame;
-    AVPacket       *pkt;
+    const AVCodec        *codec;
+    AVCodecContext       *ctx;
+    AVCodecParserContext *parser;
+    AVFrame              *frame;
+    AVPacket             *pkt;
 } hevc_decoder_t;
 
 static int hevc_decoder_init(hevc_decoder_t *dec) {
@@ -425,13 +426,18 @@ static int hevc_decoder_init(hevc_decoder_t *dec) {
     if (!dec->codec) return -1;
     av_log_set_level(AV_LOG_FATAL);
 
-    dec->ctx = avcodec_alloc_context3(dec->codec);
-    if (!dec->ctx) return -1;
+    dec->parser = av_parser_init(dec->codec->id);
+    dec->ctx    = avcodec_alloc_context3(dec->codec);
+    if (!dec->parser || !dec->ctx) return -1;
 
-    dec->ctx->flags  |= AV_CODEC_FLAG_LOW_DELAY | AV_CODEC_FLAG_OUTPUT_CORRUPT;
-    dec->ctx->flags2 |= AV_CODEC_FLAG2_FAST | AV_CODEC_FLAG2_SHOW_ALL;
-    dec->ctx->thread_type  = 0;
-    dec->ctx->thread_count = 1;
+    /* BYPASS 1-FRAME LOOKAHEAD: Emit frame immediately on arrival */
+    dec->parser->flags |= PARSER_FLAG_COMPLETE_FRAMES;
+
+    dec->ctx->flags  |= AV_CODEC_FLAG_LOW_DELAY;
+    dec->ctx->flags2 |= AV_CODEC_FLAG2_FAST;
+/* Slice multi-threading: parallelizes macroblocks with 0-frame latency */
+    dec->ctx->thread_type  = FF_THREAD_SLICE;
+    dec->ctx->thread_count = 2;
     dec->ctx->max_b_frames = 0;
     dec->ctx->has_b_frames = 0;
     dec->ctx->delay        = 0;
@@ -447,9 +453,10 @@ static int hevc_decoder_init(hevc_decoder_t *dec) {
 }
 
 static void hevc_decoder_destroy(hevc_decoder_t *dec) {
-    if (dec->frame) av_frame_free(&dec->frame);
-    if (dec->pkt)   av_packet_free(&dec->pkt);
-    if (dec->ctx)   avcodec_free_context(&dec->ctx);
+    if (dec->frame)  av_frame_free(&dec->frame);
+    if (dec->pkt)    av_packet_free(&dec->pkt);
+    if (dec->ctx)    avcodec_free_context(&dec->ctx);
+    if (dec->parser) av_parser_close(dec->parser);
 }
 
 /* ================================================================
@@ -492,49 +499,56 @@ static void *decode_render_thread_fn(void *arg) {
             break;
         }
 
-        /* Pop in strict order: NEVER skip a P-frame */
         int pop_idx = g_q_tail;
         g_q_tail = (g_q_tail + 1) % QUEUE_CAP;
         g_q_count--;
         pthread_mutex_unlock(&g_q_lock);
 
         au_slot_t *slot = &g_queue[pop_idx];
-        memset(slot->data + slot->len, 0, AV_INPUT_BUFFER_PADDING_SIZE);
-        dec.pkt->data = slot->data;
-        dec.pkt->size = slot->len;
+        const uint8_t *data = slot->data;
+        int size = (int)slot->len;
         g_pkt_no++;
 
-        double t0 = now_seconds();
-        int sret = avcodec_send_packet(dec.ctx, dec.pkt);
-        if (sret == 0) {
-            while (avcodec_receive_frame(dec.ctx, dec.frame) == 0) {
-                double t1 = now_seconds();
-                metal_upload_yuv420p_frame(dec.frame);
-                double t2 = now_seconds();
-                av_frame_unref(dec.frame);
+        /* Reassemble any fragmented USB packets cleanly into complete frames */
+        while (size > 0 && !g_quit) {
+            int consumed = av_parser_parse2(dec.parser, dec.ctx,
+                                            &dec.pkt->data, &dec.pkt->size,
+                                            data, size, AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
+            if (consumed < 0) break;
+            data += consumed;
+            size -= consumed;
 
-                if (g_metal_view) {
-                    [g_metal_view renderFrame];
-                }
-                double t3 = now_seconds();
+            if (dec.pkt->data && dec.pkt->size > 0) {
+                double t0 = now_seconds();
+                if (avcodec_send_packet(dec.ctx, dec.pkt) == 0) {
+                    while (avcodec_receive_frame(dec.ctx, dec.frame) == 0) {
+                        double t1 = now_seconds();
+                        metal_upload_yuv420p_frame(dec.frame);
+                        double t2 = now_seconds();
+                        av_frame_unref(dec.frame);
 
-                g_frame_no++;
-                g_sum_dec  += (t1 - t0) * 1e3;
-                g_sum_up   += (t2 - t1) * 1e3;
-                g_sum_rend += (t3 - t2) * 1e3;
-                if ((t3 - t2) * 1e3 > g_max_rend) g_max_rend = (t3 - t2) * 1e3;
+                        if (g_metal_view) {
+                            [g_metal_view renderFrame];
+                        }
+                        double t3 = now_seconds();
 
-                if (g_frame_no % 120 == 0) {
-                    fprintf(stderr, "[stats] aus=%llu frames=%llu | decode %.2f ms, upload %.2f ms, "
-                            "render-submit avg %.2f / max %.2f ms (nextDrawable %.2f ms)\n",
-                            g_pkt_no, g_frame_no, g_sum_dec / 120, g_sum_up / 120,
-                            g_sum_rend / 120, g_max_rend, g_sum_nd / 120);
-                    g_sum_dec = g_sum_up = g_sum_rend = g_max_rend = g_sum_nd = 0;
+                        g_frame_no++;
+                        g_sum_dec  += (t1 - t0) * 1e3;
+                        g_sum_up   += (t2 - t1) * 1e3;
+                        g_sum_rend += (t3 - t2) * 1e3;
+                        if ((t3 - t2) * 1e3 > g_max_rend) g_max_rend = (t3 - t2) * 1e3;
+
+                        if (g_frame_no % 120 == 0) {
+                            fprintf(stderr, "[stats] aus=%llu frames=%llu | decode %.2f ms, upload %.2f ms, "
+                                    "render-submit avg %.2f / max %.2f ms (nextDrawable %.2f ms)\n",
+                                    g_pkt_no, g_frame_no, g_sum_dec / 120, g_sum_up / 120,
+                                    g_sum_rend / 120, g_max_rend, g_sum_nd / 120);
+                            g_sum_dec = g_sum_up = g_sum_rend = g_max_rend = g_sum_nd = 0;
+                        }
+                    }
                 }
             }
         }
-        dec.pkt->data = NULL;
-        dec.pkt->size = 0;
     }
 
     hevc_decoder_destroy(&dec);
