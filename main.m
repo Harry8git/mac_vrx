@@ -499,6 +499,10 @@ static void *decode_render_thread_fn(void *arg) {
             break;
         }
 
+        /* ZERO-LAG GUARANTEE: If a newer frame is already waiting, decode this one
+         * to preserve the P-frame reference chain, but skip rendering to snap back to real-time */
+        bool is_latest = (g_q_count == 1);
+
         int pop_idx = g_q_tail;
         g_q_tail = (g_q_tail + 1) % QUEUE_CAP;
         g_q_count--;
@@ -523,13 +527,16 @@ static void *decode_render_thread_fn(void *arg) {
                 if (avcodec_send_packet(dec.ctx, dec.pkt) == 0) {
                     while (avcodec_receive_frame(dec.ctx, dec.frame) == 0) {
                         double t1 = now_seconds();
-                        metal_upload_yuv420p_frame(dec.frame);
+                        if (is_latest) {
+                            metal_upload_yuv420p_frame(dec.frame);
+                        }
                         double t2 = now_seconds();
                         av_frame_unref(dec.frame);
 
-                        if (g_metal_view) {
+                        if (g_metal_view && is_latest) {
                             [g_metal_view renderFrame];
                         }
+                        
                         double t3 = now_seconds();
 
                         g_frame_no++;
@@ -849,6 +856,7 @@ static void *serial_thread_fn(void *arg) {
     /* TRIPLE BUFFERING: Prevents nextDrawable from blocking on display refresh */
     layer.maximumDrawableCount = 3;
     layer.displaySyncEnabled = NO;
+    layer.opaque = YES;
 
     self.metalLayer = layer;
     return layer;
@@ -953,7 +961,7 @@ static void *serial_thread_fn(void *arg) {
     } else {
         self.savedWindowedRect = self.frame;
         self.styleMask = NSWindowStyleMaskBorderless;
-        [self setLevel:NSMainMenuWindowLevel + 1];
+        [self setLevel:NSNormalWindowLevel];
         [self setFrame:[[self screen] frame] display:YES animate:NO];
         self.isFullscreen = YES;
     }
@@ -1048,7 +1056,8 @@ int main(int argc, char **argv) {
         NSRect screenRect = [[NSScreen mainScreen] frame];
         FullscreenWindow *window = [[FullscreenWindow alloc] initWithContentRect:screenRect
             styleMask:NSWindowStyleMaskBorderless backing:NSBackingStoreBuffered defer:NO];
-        [window setLevel:NSMainMenuWindowLevel + 1];
+        /* CHANGE: Use NSNormalWindowLevel instead of NSMainMenuWindowLevel + 1 */
+        [window setLevel:NSNormalWindowLevel];
         [window setOpaque:YES];
         window.isFullscreen = YES;
         window.savedWindowedRect = NSMakeRect(100, 100, 1280, 720);
