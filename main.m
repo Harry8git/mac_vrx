@@ -86,18 +86,24 @@ static const char *kMetalShaderSource =
 "    return out;\n"
 "}\n"
 "fragment float4 yuvFragmentShader(VertexOut in [[stage_in]],\n"
-"                                  texture2d<float> yTexture [[texture(0)]],\n"
-"                                  texture2d<float> uTexture [[texture(1)]],\n"
-"                                  texture2d<float> vTexture [[texture(2)]]) {\n"
-"    constexpr sampler s(address::clamp_to_edge, filter::linear);\n"
-"    float y = yTexture.sample(s, in.texCoords).r;\n"
-"    float u = uTexture.sample(s, in.texCoords).r - 0.5;\n"
-"    float v = vTexture.sample(s, in.texCoords).r - 0.5;\n"
+"                                  texture2d<float> yTexture   [[texture(0)]],\n"
+"                                  texture2d<float> uTexture   [[texture(1)]],\n"
+"                                  texture2d<float> vTexture   [[texture(2)]],\n"
+"                                  texture2d<float> hudTexture [[texture(3)]]) {\n"
+"    constexpr sampler sVideo(address::clamp_to_edge, filter::linear);\n"
+"    constexpr sampler sHud  (address::clamp_to_edge, filter::nearest);\n"
+"    float y = yTexture.sample(sVideo, in.texCoords).r;\n"
+"    float u = uTexture.sample(sVideo, in.texCoords).r - 0.5;\n"
+"    float v = vTexture.sample(sVideo, in.texCoords).r - 0.5;\n"
 "    float3 rgb;\n"
 "    rgb.r = y + 1.5748 * v;\n"
 "    rgb.g = y - 0.1873 * u - 0.4681 * v;\n"
 "    rgb.b = y + 1.8556 * u;\n"
-"    return float4(clamp(rgb, 0.0, 1.0), 1.0);\n"
+"    float4 video = float4(clamp(rgb, 0.0, 1.0), 1.0);\n"
+"\n"
+"    float4 hud = hudTexture.sample(sHud, in.texCoords);\n"
+"    float3 blended = video.rgb * (1.0 - hud.a) + hud.rgb;\n"
+"    return float4(blended, 1.0);\n"
 "}\n";
 
 @interface FPVMetalView : NSView
@@ -115,6 +121,7 @@ typedef struct {
     id<MTLTexture>             yTex[2];
     id<MTLTexture>             uTex[2];
     id<MTLTexture>             vTex[2];
+    id<MTLTexture>             hudTex;
     int                        activeIdx;
     int                        width;
     int                        height;
@@ -148,21 +155,37 @@ static int metal_pipeline_init(id<MTLDevice> device) {
 }
 
 static void ensure_textures(int w, int h) {
-    if (g_metal.width == w && g_metal.height == h && g_metal.yTex[0] != nil) return;
-    g_metal.width = w;
-    g_metal.height = h;
+    if (g_metal.width != w || g_metal.height != h || g_metal.yTex[0] == nil) {
+        g_metal.width = w;
+        g_metal.height = h;
 
-    for (int i = 0; i < 2; i++) {
-        MTLTextureDescriptor *yd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm width:w height:h mipmapped:NO];
-        yd.usage = MTLTextureUsageShaderRead;
-        yd.storageMode = MTLStorageModeShared;
-        g_metal.yTex[i] = [g_metal.device newTextureWithDescriptor:yd];
+        for (int i = 0; i < 2; i++) {
+            MTLTextureDescriptor *yd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm width:w height:h mipmapped:NO];
+            yd.usage = MTLTextureUsageShaderRead;
+            yd.storageMode = MTLStorageModeShared;
+            g_metal.yTex[i] = [g_metal.device newTextureWithDescriptor:yd];
 
-        MTLTextureDescriptor *uvd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm width:w / 2 height:h / 2 mipmapped:NO];
-        uvd.usage = MTLTextureUsageShaderRead;
-        uvd.storageMode = MTLStorageModeShared;
-        g_metal.uTex[i] = [g_metal.device newTextureWithDescriptor:uvd];
-        g_metal.vTex[i] = [g_metal.device newTextureWithDescriptor:uvd];
+            MTLTextureDescriptor *uvd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm width:w / 2 height:h / 2 mipmapped:NO];
+            uvd.usage = MTLTextureUsageShaderRead;
+            uvd.storageMode = MTLStorageModeShared;
+            g_metal.uTex[i] = [g_metal.device newTextureWithDescriptor:uvd];
+            g_metal.vTex[i] = [g_metal.device newTextureWithDescriptor:uvd];
+        }
+    }
+    
+    /* Size HUD texture to the exact drawable pixels of the view */
+    CGSize pixelSize = g_metal_view ? [g_metal_view convertSizeToBacking:g_metal_view.bounds.size] : CGSizeMake(1920, 1080);
+    int hud_w = (int)pixelSize.width;
+    int hud_h = (int)pixelSize.height;
+
+    if (!g_metal.hudTex || [g_metal.hudTex width] != hud_w || [g_metal.hudTex height] != hud_h) {
+        MTLTextureDescriptor *hudd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm 
+                                                                                        width:hud_w 
+                                                                                       height:hud_h 
+                                                                                    mipmapped:NO];
+        hudd.usage = MTLTextureUsageShaderRead;
+        hudd.storageMode = MTLStorageModeShared;
+        g_metal.hudTex = [g_metal.device newTextureWithDescriptor:hudd];
     }
 }
 
@@ -437,7 +460,7 @@ static int hevc_decoder_init(hevc_decoder_t *dec) {
     dec->ctx->flags2 |= AV_CODEC_FLAG2_FAST;
 /* Slice multi-threading: parallelizes macroblocks with 0-frame latency */
     dec->ctx->thread_type  = FF_THREAD_SLICE;
-    dec->ctx->thread_count = 2;
+    dec->ctx->thread_count = 4;
     dec->ctx->max_b_frames = 0;
     dec->ctx->has_b_frames = 0;
     dec->ctx->delay        = 0;
@@ -536,7 +559,7 @@ static void *decode_render_thread_fn(void *arg) {
                         if (g_metal_view && is_latest) {
                             [g_metal_view renderFrame];
                         }
-                        
+
                         double t3 = now_seconds();
 
                         g_frame_no++;
@@ -760,34 +783,72 @@ static void *serial_thread_fn(void *arg) {
 }
 
 /* ================================================================
- * HUD Overlay View
+ * Zero-Latency Razor-Sharp Retina HUD Renderer
  * ================================================================ */
-@interface HUDOverlayView : NSView
-@end
+static void render_hud_to_texture(void) {
+    if (!g_metal_view) return;
 
-@implementation HUDOverlayView
+    CGFloat scale = g_metal_view.window.backingScaleFactor ?: [[NSScreen mainScreen] backingScaleFactor];
+    NSSize viewSize = g_metal_view.bounds.size;
+    CGFloat w = viewSize.width;
+    CGFloat h = viewSize.height;
+    int pixel_w = (int)(w * scale);
+    int pixel_h = (int)(h * scale);
 
-- (void)drawRect:(NSRect)dirtyRect {
-    (void)dirtyRect;
-    CGContextRef ctx = [[NSGraphicsContext currentContext] CGContext];
+    if (pixel_w <= 0 || pixel_h <= 0) return;
+
+    static uint32_t *s_hud_pixels = NULL;
+    static int s_buf_w = 0, s_buf_h = 0;
+    if (s_buf_w != pixel_w || s_buf_h != pixel_h) {
+        free(s_hud_pixels);
+        s_hud_pixels = (uint32_t *)calloc(pixel_w * pixel_h, sizeof(uint32_t));
+        s_buf_w = pixel_w;
+        s_buf_h = pixel_h;
+    } else {
+        memset(s_hud_pixels, 0, pixel_w * pixel_h * sizeof(uint32_t));
+    }
+
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(s_hud_pixels, pixel_w, pixel_h, 8, pixel_w * 4, cs,
+                                             kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+    CGColorSpaceRelease(cs);
     if (!ctx) return;
+
+    /* Scale context for Retina drawing */
+    CGContextScaleCTM(ctx, scale, scale);
+
+    /* Enhance Font Smoothing & Sharpness */
+    CGContextSetAllowsAntialiasing(ctx, true);
+    CGContextSetShouldAntialias(ctx, true);
+    CGContextSetAllowsFontSmoothing(ctx, true);
+    CGContextSetShouldSmoothFonts(ctx, true);
 
     telem_data_t telem = telem_get_snapshot();
     pthread_mutex_lock(&g_ctrl_lock);
     ctrl_state_t ctrl = g_ctrl;
     pthread_mutex_unlock(&g_ctrl_lock);
 
-    CGFloat w = self.bounds.size.width;
-    CGFloat h = self.bounds.size.height;
     CGPoint center = CGPointMake(w * 0.5, h * 0.5);
 
-    /* 1. Artificial Horizon */
+    /* 1. Artificial Horizon (Draw black backing stroke first for crisp contrast) */
     CGContextSaveGState(ctx);
     CGContextTranslateCTM(ctx, center.x, center.y);
     CGContextRotateCTM(ctx, -telem.roll_deg * (CGFloat)M_PI / 180.0);
 
     CGFloat pitchOffset = telem.pitch_deg * 6.0;
-    CGContextSetStrokeColorWithColor(ctx, [NSColor colorWithCalibratedRed:0.0 green:1.0 blue:0.4 alpha:0.85].CGColor);
+
+    // A. Black Outline / Shadow Underlay (3.0 pt)
+    CGContextSetStrokeColorWithColor(ctx, [NSColor colorWithCalibratedWhite:0.0 alpha:0.75].CGColor);
+    CGContextSetLineWidth(ctx, 3.5);
+    CGContextStrokeRect(ctx, CGRectMake(-8, -8, 16, 16));
+    CGContextMoveToPoint(ctx, -140, pitchOffset);
+    CGContextAddLineToPoint(ctx, -40, pitchOffset);
+    CGContextMoveToPoint(ctx, 40, pitchOffset);
+    CGContextAddLineToPoint(ctx, 140, pitchOffset);
+    CGContextStrokePath(ctx);
+
+    // B. Crisp Green Line (2.0 pt)
+    CGContextSetStrokeColorWithColor(ctx, [NSColor colorWithCalibratedRed:0.0 green:1.0 blue:0.4 alpha:1.0].CGColor);
     CGContextSetLineWidth(ctx, 2.0);
     CGContextStrokeRect(ctx, CGRectMake(-8, -8, 16, 16));
     CGContextMoveToPoint(ctx, -140, pitchOffset);
@@ -799,15 +860,29 @@ static void *serial_thread_fn(void *arg) {
 
     /* 2. Throttle Bar */
     CGFloat thH = 200.0, thW = 12.0, thX = 40.0, thY = (h - thH) * 0.5;
-    CGContextSetStrokeColorWithColor(ctx, [NSColor whiteColor].CGColor);
+    CGContextSetStrokeColorWithColor(ctx, [NSColor blackColor].CGColor);
+    CGContextSetLineWidth(ctx, 3.0);
     CGContextStrokeRect(ctx, CGRectMake(thX, thY, thW, thH));
-    CGContextSetFillColorWithColor(ctx, [NSColor colorWithCalibratedRed:0.2 green:0.8 blue:1.0 alpha:0.75].CGColor);
+
+    CGContextSetStrokeColorWithColor(ctx, [NSColor whiteColor].CGColor);
+    CGContextSetLineWidth(ctx, 1.5);
+    CGContextStrokeRect(ctx, CGRectMake(thX, thY, thW, thH));
+    CGContextSetFillColorWithColor(ctx, [NSColor colorWithCalibratedRed:0.2 green:0.8 blue:1.0 alpha:0.85].CGColor);
     CGContextFillRect(ctx, CGRectMake(thX + 1, thY + 1, thW - 2, thH * ctrl.throttle));
 
-    /* 3. Text OSD Elements */
+    /* 3. High-Contrast Monospaced Text */
+    [NSGraphicsContext saveGraphicsState];
+    [NSGraphicsContext setCurrentContext:[NSGraphicsContext graphicsContextWithCGContext:ctx flipped:NO]];
+
+    NSShadow *textShadow = [[NSShadow alloc] init];
+    textShadow.shadowColor = [NSColor colorWithCalibratedWhite:0.0 alpha:0.9];
+    textShadow.shadowOffset = NSMakeSize(1.0, -1.0);
+    textShadow.shadowBlurRadius = 1.0;
+
     NSDictionary *attrGreen = @{
-        NSFontAttributeName: [NSFont monospacedSystemFontOfSize:13 weight:NSFontWeightBold],
-        NSForegroundColorAttributeName: [NSColor colorWithCalibratedRed:0.0 green:1.0 blue:0.4 alpha:0.95]
+        NSFontAttributeName: [NSFont monospacedSystemFontOfSize:14 weight:NSFontWeightBold],
+        NSForegroundColorAttributeName: [NSColor colorWithCalibratedRed:0.0 green:1.0 blue:0.4 alpha:1.0],
+        NSShadowAttributeName: textShadow
     };
 
     NSString *osdTop = [NSString stringWithFormat:@"%s [%s]  %s   LQ: %u%%  RSSI: -%ddBm",
@@ -832,9 +907,14 @@ static void *serial_thread_fn(void *arg) {
                         telem.altitude_m, telem.groundspeed_kmh, telem.sats, telem.latitude, telem.longitude];
     CGSize navSize = [osdNav sizeWithAttributes:attrGreen];
     [osdNav drawAtPoint:CGPointMake(w - navSize.width - 40, 20) withAttributes:attrGreen];
-}
 
-@end
+    [NSGraphicsContext restoreGraphicsState];
+    CGContextRelease(ctx);
+
+    if (g_metal.hudTex && [g_metal.hudTex width] == pixel_w && [g_metal.hudTex height] == pixel_h) {
+        [g_metal.hudTex replaceRegion:MTLRegionMake2D(0, 0, pixel_w, pixel_h) mipmapLevel:0 withBytes:s_hud_pixels bytesPerRow:pixel_w * 4];
+    }
+}
 
 /* ================================================================
  * Metal Presentation
@@ -842,7 +922,9 @@ static void *serial_thread_fn(void *arg) {
 @implementation FPVMetalView
 
 - (instancetype)initWithFrame:(NSRect)frameRect {
-    if ((self = [super initWithFrame:frameRect])) self.wantsLayer = YES;
+    if ((self = [super initWithFrame:frameRect])) {
+        self.wantsLayer = YES;
+    }
     return self;
 }
 
@@ -853,13 +935,37 @@ static void *serial_thread_fn(void *arg) {
     layer.framebufferOnly = YES;
     layer.presentsWithTransaction = NO;
 
-    /* TRIPLE BUFFERING: Prevents nextDrawable from blocking on display refresh */
     layer.maximumDrawableCount = 3;
     layer.displaySyncEnabled = NO;
     layer.opaque = YES;
 
+    /* Enable Retina Native 2x/3x backing */
+    CGFloat scale = [[NSScreen mainScreen] backingScaleFactor];
+    layer.contentsScale = scale;
+    CGSize viewSize = self.bounds.size;
+    layer.drawableSize = CGSizeMake(viewSize.width * scale, viewSize.height * scale);
+
     self.metalLayer = layer;
     return layer;
+}
+
+- (void)viewDidChangeBackingProperties {
+    [super viewDidChangeBackingProperties];
+    [self updateDrawableSize];
+}
+
+- (void)setFrameSize:(NSSize)newSize {
+    [super setFrameSize:newSize];
+    [self updateDrawableSize];
+}
+
+- (void)updateDrawableSize {
+    CGFloat scale = self.window.backingScaleFactor ?: [[NSScreen mainScreen] backingScaleFactor];
+    self.metalLayer.contentsScale = scale;
+    CGSize pixelSize = [self convertSizeToBacking:self.bounds.size];
+    if (pixelSize.width > 0 && pixelSize.height > 0) {
+        self.metalLayer.drawableSize = pixelSize;
+    }
 }
 
 - (void)renderFrame {
@@ -890,6 +996,9 @@ static void *serial_thread_fn(void *arg) {
     [enc setFragmentTexture:y atIndex:0];
     [enc setFragmentTexture:u atIndex:1];
     [enc setFragmentTexture:v atIndex:2];
+    if (g_metal.hudTex) {
+        [enc setFragmentTexture:g_metal.hudTex atIndex:3]; /* <-- ADD THIS LINE */
+    }
     [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
     [enc endEncoding];
 
@@ -961,7 +1070,7 @@ static void *serial_thread_fn(void *arg) {
     } else {
         self.savedWindowedRect = self.frame;
         self.styleMask = NSWindowStyleMaskBorderless;
-        [self setLevel:NSNormalWindowLevel];
+        [self setLevel:NSMainMenuWindowLevel + 1]; /* Covers menu bar */
         [self setFrame:[[self screen] frame] display:YES animate:NO];
         self.isFullscreen = YES;
     }
@@ -1056,19 +1165,15 @@ int main(int argc, char **argv) {
         NSRect screenRect = [[NSScreen mainScreen] frame];
         FullscreenWindow *window = [[FullscreenWindow alloc] initWithContentRect:screenRect
             styleMask:NSWindowStyleMaskBorderless backing:NSBackingStoreBuffered defer:NO];
-        /* CHANGE: Use NSNormalWindowLevel instead of NSMainMenuWindowLevel + 1 */
-        [window setLevel:NSNormalWindowLevel];
+        [window setLevel:NSMainMenuWindowLevel + 1];
         [window setOpaque:YES];
         window.isFullscreen = YES;
         window.savedWindowedRect = NSMakeRect(100, 100, 1280, 720);
 
         FPVMetalView *metalView = [[FPVMetalView alloc] initWithFrame:screenRect];
         g_metal_view = metalView;
-        HUDOverlayView *hudView = [[HUDOverlayView alloc] initWithFrame:metalView.bounds];
         metalView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-        hudView.autoresizingMask   = NSViewWidthSizable | NSViewHeightSizable;
 
-        if (!getenv("NOHUD")) [metalView addSubview:hudView];
         fprintf(stderr, "[mac] screen max refresh: %ld Hz\n",
                 (long)[[NSScreen mainScreen] maximumFramesPerSecond]);
 
@@ -1076,9 +1181,10 @@ int main(int argc, char **argv) {
         [window makeKeyAndOrderFront:nil];
         [NSApp activateIgnoringOtherApps:YES];
 
+        /* Update HUD at 60Hz into the Metal texture with zero compositor penalty */
         [NSTimer scheduledTimerWithTimeInterval:0.016 repeats:YES block:^(NSTimer *timer) {
             (void)timer;
-            [hudView setNeedsDisplay:YES];
+            render_hud_to_texture();
         }];
 
         pthread_t video_tid, serial_tid;
