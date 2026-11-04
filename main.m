@@ -40,7 +40,7 @@
 #define MAX_AU_PAYLOAD          (2 * 1024 * 1024)
 
 /* ---------------- ArduPilot CRSF link config ---------------- */
-#define ARDUPILOT_SERIAL_DEV_DEFAULT "/dev/cu.usbmodem14201"
+#define ARDUPILOT_SERIAL_DEV_DEFAULT "/dev/cu.usbmodem2103"
 #define ARDUPILOT_BAUD          B115200
 #define CRSF_TX_HZ              50
 #define SERIAL_RETRY_MS         2000
@@ -443,22 +443,56 @@ typedef struct {
     AVPacket             *pkt;
 } hevc_decoder_t;
 
-static int hevc_decoder_init(hevc_decoder_t *dec) {
+/*static int hevc_decoder_init(hevc_decoder_t *dec) {
     memset(dec, 0, sizeof(*dec));
     dec->codec = avcodec_find_decoder(AV_CODEC_ID_HEVC);
     if (!dec->codec) return -1;
-    av_log_set_level(AV_LOG_FATAL);
-
+    // av_log_set_level(AV_LOG_FATAL);
+    // av_log_set_level(AV_LOG_WARNING);
+    av_log_set_level(AV_LOG_INFO);
     dec->parser = av_parser_init(dec->codec->id);
     dec->ctx    = avcodec_alloc_context3(dec->codec);
     if (!dec->parser || !dec->ctx) return -1;
 
-    /* BYPASS 1-FRAME LOOKAHEAD: Emit frame immediately on arrival */
-    dec->parser->flags |= PARSER_FLAG_COMPLETE_FRAMES;
+    // BYPASS 1-FRAME LOOKAHEAD: Emit frame immediately on arrival
+    //dec->parser->flags |= PARSER_FLAG_COMPLETE_FRAMES;
 
     dec->ctx->flags  |= AV_CODEC_FLAG_LOW_DELAY;
     dec->ctx->flags2 |= AV_CODEC_FLAG2_FAST;
-/* Slice multi-threading: parallelizes macroblocks with 0-frame latency */
+    dec->ctx->thread_type  = FF_THREAD_SLICE;
+    dec->ctx->thread_count = 4;
+    dec->ctx->max_b_frames = 0;
+    dec->ctx->has_b_frames = 0;
+    dec->ctx->delay        = 0;
+
+    AVDictionary *opts = NULL;
+    av_dict_set(&opts, "tune", "zerolatency", 0);
+    if (avcodec_open2(dec->ctx, dec->codec, &opts) < 0) return -1;
+    av_dict_free(&opts);
+
+    dec->frame = av_frame_alloc();
+    dec->pkt   = av_packet_alloc();
+    return (dec->frame && dec->pkt) ? 0 : -1;
+}*/
+
+static int hevc_decoder_init(hevc_decoder_t *dec) {
+    memset(dec, 0, sizeof(*dec));
+    dec->codec = avcodec_find_decoder(AV_CODEC_ID_HEVC);
+    if (!dec->codec) return -1;
+
+    av_log_set_level(AV_LOG_INFO);
+    dec->parser = av_parser_init(dec->codec->id);
+    dec->ctx    = avcodec_alloc_context3(dec->codec);
+    if (!dec->parser || !dec->ctx) return -1;
+
+    dec->ctx->flags  |= AV_CODEC_FLAG_LOW_DELAY;
+    dec->ctx->flags2 |= AV_CODEC_FLAG2_FAST;
+
+    /* FORCE GREY CONCEALMENT: Never drop frames due to missing references */
+    dec->ctx->flags  |= AV_CODEC_FLAG_OUTPUT_CORRUPT;
+    dec->ctx->flags2 |= AV_CODEC_FLAG2_SHOW_ALL;
+
+    /* Slice multi-threading: parallelizes macroblocks with 0-frame latency */
     dec->ctx->thread_type  = FF_THREAD_SLICE;
     dec->ctx->thread_count = 4;
     dec->ctx->max_b_frames = 0;
@@ -475,6 +509,8 @@ static int hevc_decoder_init(hevc_decoder_t *dec) {
     return (dec->frame && dec->pkt) ? 0 : -1;
 }
 
+
+
 static void hevc_decoder_destroy(hevc_decoder_t *dec) {
     if (dec->frame)  av_frame_free(&dec->frame);
     if (dec->pkt)    av_packet_free(&dec->pkt);
@@ -482,13 +518,12 @@ static void hevc_decoder_destroy(hevc_decoder_t *dec) {
     if (dec->parser) av_parser_close(dec->parser);
 }
 
-/* ================================================================
- * Decoupled Strict FIFO Queue & Decoder/Render Worker Thread
- * ================================================================ */
-#define QUEUE_CAP 8
+/* ---------------- Queue Configuration ---------------- */
+#define QUEUE_CAP          512              /* 1024 slots provides a safe ~250ms+ jitter buffer */
+#define QUEUE_SLOT_SIZE    (16 * 1024)       /* 4 KB per slot is plenty for USB chunks */
 
 typedef struct {
-    uint8_t  data[MAX_AU_PAYLOAD + AV_INPUT_BUFFER_PADDING_SIZE];
+    uint8_t  data[QUEUE_SLOT_SIZE + AV_INPUT_BUFFER_PADDING_SIZE];
     uint32_t len;
 } au_slot_t;
 
@@ -503,6 +538,7 @@ static uint64_t g_pkt_no, g_frame_no;
 static double   g_t0;
 static double   g_sum_dec, g_sum_up, g_sum_rend, g_max_rend, g_sum_nd;
 
+
 static void *decode_render_thread_fn(void *arg) {
     (void)arg;
     hevc_decoder_t dec;
@@ -511,6 +547,11 @@ static void *decode_render_thread_fn(void *arg) {
         return NULL;
     }
     fprintf(stderr, "[decode] Decoder & Render worker thread active\n");
+
+    uint64_t total_bytes_fed = 0;
+    uint32_t send_err_count = 0;
+    uint32_t receive_err_count = 0;
+    uint32_t frames_decoded = 0;
 
     while (!g_quit) {
         pthread_mutex_lock(&g_q_lock);
@@ -522,10 +563,6 @@ static void *decode_render_thread_fn(void *arg) {
             break;
         }
 
-        /* ZERO-LAG GUARANTEE: If a newer frame is already waiting, decode this one
-         * to preserve the P-frame reference chain, but skip rendering to snap back to real-time */
-        bool is_latest = (g_q_count == 1);
-
         int pop_idx = g_q_tail;
         g_q_tail = (g_q_tail + 1) % QUEUE_CAP;
         g_q_count--;
@@ -534,49 +571,45 @@ static void *decode_render_thread_fn(void *arg) {
         au_slot_t *slot = &g_queue[pop_idx];
         const uint8_t *data = slot->data;
         int size = (int)slot->len;
-        g_pkt_no++;
+        total_bytes_fed += size;
 
-        /* Reassemble any fragmented USB packets cleanly into complete frames */
         while (size > 0 && !g_quit) {
             int consumed = av_parser_parse2(dec.parser, dec.ctx,
                                             &dec.pkt->data, &dec.pkt->size,
                                             data, size, AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
-            if (consumed < 0) break;
+            if (consumed < 0) {
+                fprintf(stderr, "[hevc] Parser error consumed < 0\n");
+                break;
+            }
             data += consumed;
             size -= consumed;
 
             if (dec.pkt->data && dec.pkt->size > 0) {
-                double t0 = now_seconds();
-                if (avcodec_send_packet(dec.ctx, dec.pkt) == 0) {
-                    while (avcodec_receive_frame(dec.ctx, dec.frame) == 0) {
-                        double t1 = now_seconds();
-                        if (is_latest) {
-                            metal_upload_yuv420p_frame(dec.frame);
-                        }
-                        double t2 = now_seconds();
+                int ret = avcodec_send_packet(dec.ctx, dec.pkt);
+                if (ret != 0) {
+                    send_err_count++;
+                    char errbuf[128];
+                    av_strerror(ret, errbuf, sizeof(errbuf));
+                    fprintf(stderr, "[hevc] send_packet error #%u: %s (size=%d)\n", 
+                            send_err_count, errbuf, dec.pkt->size);
+                } else {
+                    int r_frame;
+                    while ((r_frame = avcodec_receive_frame(dec.ctx, dec.frame)) == 0) {
+                        frames_decoded++;
+                        metal_upload_yuv420p_frame(dec.frame);
                         av_frame_unref(dec.frame);
 
-                        if (g_metal_view && is_latest) {
+                        if (g_metal_view) {
                             [g_metal_view renderFrame];
                         }
-
-                        double t3 = now_seconds();
-
-                        g_frame_no++;
-                        g_sum_dec  += (t1 - t0) * 1e3;
-                        g_sum_up   += (t2 - t1) * 1e3;
-                        g_sum_rend += (t3 - t2) * 1e3;
-                        if ((t3 - t2) * 1e3 > g_max_rend) g_max_rend = (t3 - t2) * 1e3;
-
-                        if (g_frame_no % 120 == 0) {
-                            fprintf(stderr, "[stats] aus=%llu frames=%llu | decode %.2f ms, upload %.2f ms, "
-                                    "render-submit avg %.2f / max %.2f ms (nextDrawable %.2f ms)\n",
-                                    g_pkt_no, g_frame_no, g_sum_dec / 120, g_sum_up / 120,
-                                    g_sum_rend / 120, g_max_rend, g_sum_nd / 120);
-                            g_sum_dec = g_sum_up = g_sum_rend = g_max_rend = g_sum_nd = 0;
-                        }
+                    }
+                    if (r_frame != AVERROR(EAGAIN) && r_frame != 0) {
+                        receive_err_count++;
                     }
                 }
+                // Clear packet pointer references after submission
+                dec.pkt->data = NULL;
+                dec.pkt->size = 0;
             }
         }
     }
@@ -650,29 +683,38 @@ static void *video_thread_fn(void *arg) {
             usleep(500 * 1000);
             continue;
         }
-
+        // libusb_clear_halt(dev, ep_in_addr);
+        
         fprintf(stderr, "[video] Connected! EP 0x%02X streaming\n", ep_in_addr);
 
         while (!g_quit) {
             int actual = 0;
             int ret = libusb_bulk_transfer(dev, ep_in_addr, usb_buffer, BUFFER_SIZE, &actual, 100);
 
+            static double last_print = 0;
+            double now = now_seconds();
+            if (now - last_print >= 1.0) {
+                last_print = now;
+                fprintf(stderr, "[libusb] bulk_transfer ret=%d (%s), actual=%d bytes\n",
+                        ret, libusb_error_name(ret), actual);
+            }
+
             if (ret == 0 && actual > 0) {
                 if (g_t0 == 0) g_t0 = now_seconds();
 
                 pthread_mutex_lock(&g_q_lock);
                 if (g_q_count < QUEUE_CAP) {
-                    memcpy(g_queue[g_q_head].data, usb_buffer, actual);
-                    g_queue[g_q_head].len = actual;
+                    uint32_t copy_len = (actual > QUEUE_SLOT_SIZE) ? QUEUE_SLOT_SIZE : (uint32_t)actual;
+                    memcpy(g_queue[g_q_head].data, usb_buffer, copy_len);
+                    g_queue[g_q_head].len = copy_len;
                     g_q_head = (g_q_head + 1) % QUEUE_CAP;
                     g_q_count++;
                     pthread_cond_signal(&g_q_cond);
                 } else {
-                    /* Queue overflow: print a warning so we see if host fell behind */
-                    fprintf(stderr, "[warn] FIFO full! Dropped frame\n");
+                    /* Queue overflow warning */
+                    fprintf(stderr, "[warn] FIFO full! Dropped packet\n");
                 }
                 pthread_mutex_unlock(&g_q_lock);
-
             } else if (ret == LIBUSB_ERROR_NO_DEVICE || ret == LIBUSB_ERROR_IO) {
                 fprintf(stderr, "[video] Device disconnected\n");
                 break;
