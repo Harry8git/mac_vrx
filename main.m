@@ -443,37 +443,7 @@ typedef struct {
     AVPacket             *pkt;
 } hevc_decoder_t;
 
-/*static int hevc_decoder_init(hevc_decoder_t *dec) {
-    memset(dec, 0, sizeof(*dec));
-    dec->codec = avcodec_find_decoder(AV_CODEC_ID_HEVC);
-    if (!dec->codec) return -1;
-    // av_log_set_level(AV_LOG_FATAL);
-    // av_log_set_level(AV_LOG_WARNING);
-    av_log_set_level(AV_LOG_INFO);
-    dec->parser = av_parser_init(dec->codec->id);
-    dec->ctx    = avcodec_alloc_context3(dec->codec);
-    if (!dec->parser || !dec->ctx) return -1;
 
-    // BYPASS 1-FRAME LOOKAHEAD: Emit frame immediately on arrival
-    //dec->parser->flags |= PARSER_FLAG_COMPLETE_FRAMES;
-
-    dec->ctx->flags  |= AV_CODEC_FLAG_LOW_DELAY;
-    dec->ctx->flags2 |= AV_CODEC_FLAG2_FAST;
-    dec->ctx->thread_type  = FF_THREAD_SLICE;
-    dec->ctx->thread_count = 4;
-    dec->ctx->max_b_frames = 0;
-    dec->ctx->has_b_frames = 0;
-    dec->ctx->delay        = 0;
-
-    AVDictionary *opts = NULL;
-    av_dict_set(&opts, "tune", "zerolatency", 0);
-    if (avcodec_open2(dec->ctx, dec->codec, &opts) < 0) return -1;
-    av_dict_free(&opts);
-
-    dec->frame = av_frame_alloc();
-    dec->pkt   = av_packet_alloc();
-    return (dec->frame && dec->pkt) ? 0 : -1;
-}*/
 
 static int hevc_decoder_init(hevc_decoder_t *dec) {
     memset(dec, 0, sizeof(*dec));
@@ -487,6 +457,7 @@ static int hevc_decoder_init(hevc_decoder_t *dec) {
 
     dec->ctx->flags  |= AV_CODEC_FLAG_LOW_DELAY;
     dec->ctx->flags2 |= AV_CODEC_FLAG2_FAST;
+    //dec->parser->flags |= PARSER_FLAG_COMPLETE_FRAMES;
 
     /* FORCE GREY CONCEALMENT: Never drop frames due to missing references */
     dec->ctx->flags  |= AV_CODEC_FLAG_OUTPUT_CORRUPT;
@@ -519,8 +490,8 @@ static void hevc_decoder_destroy(hevc_decoder_t *dec) {
 }
 
 /* ---------------- Queue Configuration ---------------- */
-#define QUEUE_CAP          512              /* 1024 slots provides a safe ~250ms+ jitter buffer */
-#define QUEUE_SLOT_SIZE    (16 * 1024)       /* 4 KB per slot is plenty for USB chunks */
+#define QUEUE_CAP          128           
+#define QUEUE_SLOT_SIZE    BUFFER_SIZE
 
 typedef struct {
     uint8_t  data[QUEUE_SLOT_SIZE + AV_INPUT_BUFFER_PADDING_SIZE];
@@ -548,11 +519,6 @@ static void *decode_render_thread_fn(void *arg) {
     }
     fprintf(stderr, "[decode] Decoder & Render worker thread active\n");
 
-    uint64_t total_bytes_fed = 0;
-    uint32_t send_err_count = 0;
-    uint32_t receive_err_count = 0;
-    uint32_t frames_decoded = 0;
-
     while (!g_quit) {
         pthread_mutex_lock(&g_q_lock);
         while (g_q_count == 0 && !g_quit) {
@@ -571,31 +537,20 @@ static void *decode_render_thread_fn(void *arg) {
         au_slot_t *slot = &g_queue[pop_idx];
         const uint8_t *data = slot->data;
         int size = (int)slot->len;
-        total_bytes_fed += size;
 
         while (size > 0 && !g_quit) {
             int consumed = av_parser_parse2(dec.parser, dec.ctx,
                                             &dec.pkt->data, &dec.pkt->size,
-                                            data, size, AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
-            if (consumed < 0) {
-                fprintf(stderr, "[hevc] Parser error consumed < 0\n");
-                break;
-            }
+                                            data, size, 
+                                            AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
+            if (consumed < 0) break;
+
             data += consumed;
             size -= consumed;
 
-            if (dec.pkt->data && dec.pkt->size > 0) {
-                int ret = avcodec_send_packet(dec.ctx, dec.pkt);
-                if (ret != 0) {
-                    send_err_count++;
-                    char errbuf[128];
-                    av_strerror(ret, errbuf, sizeof(errbuf));
-                    fprintf(stderr, "[hevc] send_packet error #%u: %s (size=%d)\n", 
-                            send_err_count, errbuf, dec.pkt->size);
-                } else {
-                    int r_frame;
-                    while ((r_frame = avcodec_receive_frame(dec.ctx, dec.frame)) == 0) {
-                        frames_decoded++;
+            if (dec.pkt->size > 0) {
+                if (avcodec_send_packet(dec.ctx, dec.pkt) == 0) {
+                    while (avcodec_receive_frame(dec.ctx, dec.frame) == 0) {
                         metal_upload_yuv420p_frame(dec.frame);
                         av_frame_unref(dec.frame);
 
@@ -603,11 +558,7 @@ static void *decode_render_thread_fn(void *arg) {
                             [g_metal_view renderFrame];
                         }
                     }
-                    if (r_frame != AVERROR(EAGAIN) && r_frame != 0) {
-                        receive_err_count++;
-                    }
                 }
-                // Clear packet pointer references after submission
                 dec.pkt->data = NULL;
                 dec.pkt->size = 0;
             }
@@ -703,17 +654,22 @@ static void *video_thread_fn(void *arg) {
                 if (g_t0 == 0) g_t0 = now_seconds();
 
                 pthread_mutex_lock(&g_q_lock);
-                if (g_q_count < QUEUE_CAP) {
-                    uint32_t copy_len = (actual > QUEUE_SLOT_SIZE) ? QUEUE_SLOT_SIZE : (uint32_t)actual;
-                    memcpy(g_queue[g_q_head].data, usb_buffer, copy_len);
-                    g_queue[g_q_head].len = copy_len;
-                    g_q_head = (g_q_head + 1) % QUEUE_CAP;
-                    g_q_count++;
-                    pthread_cond_signal(&g_q_cond);
-                } else {
-                    /* Queue overflow warning */
-                    fprintf(stderr, "[warn] FIFO full! Dropped packet\n");
+
+                // --- DROP-TO-LIVE: Jitter buffer guard ---
+                // 1 frame is ~8-12 chunks. Dropping at >= 20 slots (~25-30ms) prevents
+                // mid-frame chunk drops while guaranteeing zero buffer bloat.
+                while (g_q_count >= 20) {
+                    g_q_tail = (g_q_tail + 1) % QUEUE_CAP;
+                    g_q_count--;
                 }
+
+                uint32_t copy_len = (actual > QUEUE_SLOT_SIZE) ? QUEUE_SLOT_SIZE : (uint32_t)actual;
+                memcpy(g_queue[g_q_head].data, usb_buffer, copy_len);
+                g_queue[g_q_head].len = copy_len;
+                g_q_head = (g_q_head + 1) % QUEUE_CAP;
+                g_q_count++;
+                pthread_cond_signal(&g_q_cond);
+
                 pthread_mutex_unlock(&g_q_lock);
             } else if (ret == LIBUSB_ERROR_NO_DEVICE || ret == LIBUSB_ERROR_IO) {
                 fprintf(stderr, "[video] Device disconnected\n");
@@ -840,30 +796,40 @@ static void render_hud_to_texture(void) {
     if (pixel_w <= 0 || pixel_h <= 0) return;
 
     static uint32_t *s_hud_pixels = NULL;
+    static CGContextRef s_cached_ctx = NULL;
     static int s_buf_w = 0, s_buf_h = 0;
+
+    // 1. Reallocate pixel buffer & context ONLY when window dimensions change
     if (s_buf_w != pixel_w || s_buf_h != pixel_h) {
+        if (s_cached_ctx) {
+            CGContextRelease(s_cached_ctx);
+            s_cached_ctx = NULL;
+        }
         free(s_hud_pixels);
         s_hud_pixels = (uint32_t *)calloc(pixel_w * pixel_h, sizeof(uint32_t));
         s_buf_w = pixel_w;
         s_buf_h = pixel_h;
+
+        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+        s_cached_ctx = CGBitmapContextCreate(s_hud_pixels, pixel_w, pixel_h, 8, pixel_w * 4, cs,
+                                             kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+        CGColorSpaceRelease(cs);
+
+        CGContextSetAllowsAntialiasing(s_cached_ctx, true);
+        CGContextSetShouldAntialias(s_cached_ctx, true);
+        CGContextSetAllowsFontSmoothing(s_cached_ctx, true);
+        CGContextSetShouldSmoothFonts(s_cached_ctx, true);
     } else {
+        // Clear pixel buffer for this frame
         memset(s_hud_pixels, 0, pixel_w * pixel_h * sizeof(uint32_t));
     }
 
-    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-    CGContextRef ctx = CGBitmapContextCreate(s_hud_pixels, pixel_w, pixel_h, 8, pixel_w * 4, cs,
-                                             kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
-    CGColorSpaceRelease(cs);
+    CGContextRef ctx = s_cached_ctx;
     if (!ctx) return;
 
-    /* Scale context for Retina drawing */
+    // 2. ISOLATE SCALE: Push clean state so scale does not compound every frame
+    CGContextSaveGState(ctx);
     CGContextScaleCTM(ctx, scale, scale);
-
-    /* Enhance Font Smoothing & Sharpness */
-    CGContextSetAllowsAntialiasing(ctx, true);
-    CGContextSetShouldAntialias(ctx, true);
-    CGContextSetAllowsFontSmoothing(ctx, true);
-    CGContextSetShouldSmoothFonts(ctx, true);
 
     telem_data_t telem = telem_get_snapshot();
     pthread_mutex_lock(&g_ctrl_lock);
@@ -879,7 +845,7 @@ static void render_hud_to_texture(void) {
 
     CGFloat pitchOffset = telem.pitch_deg * 6.0;
 
-    // A. Black Outline / Shadow Underlay (3.0 pt)
+    // A. Black Outline / Shadow Underlay (3.5 pt)
     CGContextSetStrokeColorWithColor(ctx, [NSColor colorWithCalibratedWhite:0.0 alpha:0.75].CGColor);
     CGContextSetLineWidth(ctx, 3.5);
     CGContextStrokeRect(ctx, CGRectMake(-8, -8, 16, 16));
@@ -951,11 +917,19 @@ static void render_hud_to_texture(void) {
     [osdNav drawAtPoint:CGPointMake(w - navSize.width - 40, 20) withAttributes:attrGreen];
 
     [NSGraphicsContext restoreGraphicsState];
-    CGContextRelease(ctx);
 
+    // 3. RESTORE GSTATE: Pops the scale transform so the context starts with identity next frame
+    CGContextRestoreGState(ctx);
+
+    // 4. THREAD-SAFE UPLOAD: Protect texture upload against concurrent Metal render pass
+    pthread_mutex_lock(&g_metal.tex_lock);
     if (g_metal.hudTex && [g_metal.hudTex width] == pixel_w && [g_metal.hudTex height] == pixel_h) {
-        [g_metal.hudTex replaceRegion:MTLRegionMake2D(0, 0, pixel_w, pixel_h) mipmapLevel:0 withBytes:s_hud_pixels bytesPerRow:pixel_w * 4];
+        [g_metal.hudTex replaceRegion:MTLRegionMake2D(0, 0, pixel_w, pixel_h)
+                          mipmapLevel:0
+                            withBytes:s_hud_pixels
+                          bytesPerRow:pixel_w * 4];
     }
+    pthread_mutex_unlock(&g_metal.tex_lock);
 }
 
 /* ================================================================
