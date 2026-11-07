@@ -457,16 +457,15 @@ static int hevc_decoder_init(hevc_decoder_t *dec) {
 
     dec->ctx->flags  |= AV_CODEC_FLAG_LOW_DELAY;
     dec->ctx->flags2 |= AV_CODEC_FLAG2_FAST;
-    dec->parser->flags |= PARSER_FLAG_COMPLETE_FRAMES;
+    //dec->parser->flags |= PARSER_FLAG_COMPLETE_FRAMES;
 
     /* FORCE GREY CONCEALMENT: Never drop frames due to missing references */
     dec->ctx->flags  |= AV_CODEC_FLAG_OUTPUT_CORRUPT;
     dec->ctx->flags2 |= AV_CODEC_FLAG2_SHOW_ALL;
 
-    /* Force single-thread: ZERO frame-threading latency buffer */
-    dec->ctx->thread_count = 1;
-    dec->ctx->thread_type  = 0;
-    dec->ctx->active_thread_type = 0;
+    /* Slice multi-threading: parallelizes macroblocks with 0-frame latency */
+    dec->ctx->thread_type  = FF_THREAD_SLICE;
+    dec->ctx->thread_count = 4;
     dec->ctx->max_b_frames = 0;
     dec->ctx->has_b_frames = 0;
     dec->ctx->delay        = 0;
@@ -474,8 +473,6 @@ static int hevc_decoder_init(hevc_decoder_t *dec) {
     AVDictionary *opts = NULL;
     av_dict_set(&opts, "tune", "zerolatency", 0);
     if (avcodec_open2(dec->ctx, dec->codec, &opts) < 0) return -1;
-    fprintf(stderr, "[decode-init] Codec delay: %d frames | active_thread_type: %d\n",
-            dec->ctx->delay, dec->ctx->active_thread_type);
     av_dict_free(&opts);
 
     dec->frame = av_frame_alloc();
@@ -499,7 +496,6 @@ static void hevc_decoder_destroy(hevc_decoder_t *dec) {
 typedef struct {
     uint8_t  data[QUEUE_SLOT_SIZE + AV_INPUT_BUFFER_PADDING_SIZE];
     uint32_t len;
-    double   rx_time; /* Timestamp when USB packet arrived */
 } au_slot_t;
 
 static au_slot_t       g_queue[QUEUE_CAP];
@@ -535,30 +531,12 @@ static void *decode_render_thread_fn(void *arg) {
 
         int pop_idx = g_q_tail;
         g_q_tail = (g_q_tail + 1) % QUEUE_CAP;
-        int current_q_depth = g_q_count; // Read current backlog
         g_q_count--;
         pthread_mutex_unlock(&g_q_lock);
-
-        /* Diagnostic: print queue depth every 60 frames */
-        
-        static int q_diag_cnt = 0;
-        if (++q_diag_cnt % 60 == 0) {
-            fprintf(stderr, "[mac-diag] Ingest queue backlog: %d slots | wait nextDrawable avg: %.2f ms\n",
-                    current_q_depth, g_sum_nd / 60.0);
-            g_sum_nd = 0;
-        }
 
         au_slot_t *slot = &g_queue[pop_idx];
         const uint8_t *data = slot->data;
         int size = (int)slot->len;
-
-        static uint64_t s_slots_in = 0;
-        static uint64_t s_frames_out = 0;
-        static double s_total_dec_ms = 0;
-        static double s_total_up_ms = 0;
-        static int s_stat_cnt = 0;
-
-        s_slots_in++;
 
         while (size > 0 && !g_quit) {
             int consumed = av_parser_parse2(dec.parser, dec.ctx,
@@ -571,48 +549,19 @@ static void *decode_render_thread_fn(void *arg) {
             size -= consumed;
 
             if (dec.pkt->size > 0) {
-                double t_dec0 = CACurrentMediaTime();
                 if (avcodec_send_packet(dec.ctx, dec.pkt) == 0) {
                     while (avcodec_receive_frame(dec.ctx, dec.frame) == 0) {
-                        double t_dec1 = CACurrentMediaTime();
-                        s_total_dec_ms += (t_dec1 - t_dec0) * 1000.0;
-
-                        double t_up0 = CACurrentMediaTime();
                         metal_upload_yuv420p_frame(dec.frame);
-                        double t_up1 = CACurrentMediaTime();
-                        s_total_up_ms += (t_up1 - t_up0) * 1000.0;
-
-                        s_frames_out++;
                         av_frame_unref(dec.frame);
 
                         if (g_metal_view) {
                             [g_metal_view renderFrame];
-                        }
-
-                        /* Measure total time from USB packet arrival to Metal render */
-                        double total_mac_ms = (CACurrentMediaTime() - slot->rx_time) * 1000.0;
-                        static double s_mac_transit_sum = 0;
-                        s_mac_transit_sum += total_mac_ms;
-
-                        if (s_frames_out % 60 == 0) {
-                            fprintf(stderr, "[mac-total] USB Ingest -> Metal Render: %.2f ms\n",
-                                    s_mac_transit_sum / 60.0);
-                            s_mac_transit_sum = 0;
                         }
                     }
                 }
                 dec.pkt->data = NULL;
                 dec.pkt->size = 0;
             }
-        }
-
-        if (++s_stat_cnt % 60 == 0) {
-            fprintf(stderr, "[mac-bench] Decode: %.2f ms | Upload: %.2f ms | Parser Lag: %lld slots\n",
-                    s_total_dec_ms / 60.0,
-                    s_total_up_ms / 60.0,
-                    (long long)(s_slots_in - s_frames_out));
-            s_total_dec_ms = 0;
-            s_total_up_ms = 0;
         }
     }
 
@@ -717,10 +666,8 @@ static void *video_thread_fn(void *arg) {
                 uint32_t copy_len = (actual > QUEUE_SLOT_SIZE) ? QUEUE_SLOT_SIZE : (uint32_t)actual;
                 memcpy(g_queue[g_q_head].data, usb_buffer, copy_len);
                 g_queue[g_q_head].len = copy_len;
-                g_queue[g_q_head].rx_time = CACurrentMediaTime(); /* <-- ADD THIS */
                 g_q_head = (g_q_head + 1) % QUEUE_CAP;
                 g_q_count++;
-
                 pthread_cond_signal(&g_q_cond);
 
                 pthread_mutex_unlock(&g_q_lock);
@@ -1004,7 +951,7 @@ static void render_hud_to_texture(void) {
     layer.framebufferOnly = YES;
     layer.presentsWithTransaction = NO;
 
-    layer.maximumDrawableCount = 2;
+    layer.maximumDrawableCount = 3;
     layer.displaySyncEnabled = NO;
     layer.opaque = YES;
 
