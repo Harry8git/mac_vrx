@@ -42,7 +42,7 @@
 /* ---------------- ArduPilot CRSF link config ---------------- */
 #define ARDUPILOT_SERIAL_DEV_DEFAULT "/dev/cu.usbmodem2103"
 #define ARDUPILOT_BAUD          B115200
-#define CRSF_TX_HZ              50
+#define CRSF_TX_HZ              100
 #define SERIAL_RETRY_MS         2000
 
 #define CRSF_SYNC_FC            0xC8
@@ -187,6 +187,27 @@ static void ensure_textures(int w, int h) {
         hudd.storageMode = MTLStorageModeShared;
         g_metal.hudTex = [g_metal.device newTextureWithDescriptor:hudd];
     }
+}
+
+static void metal_init_black_textures(void) {
+    int w = 1280, h = 720;
+    ensure_textures(w, h);
+
+    uint8_t *black_y = (uint8_t *)calloc(w * h, 1);
+    uint8_t *gray_uv = (uint8_t *)malloc((w / 2) * (h / 2));
+    memset(gray_uv, 128, (w / 2) * (h / 2)); // 128 = 0.5 in normalized UV -> pure black in RGB
+
+    pthread_mutex_lock(&g_metal.tex_lock);
+    for (int i = 0; i < 2; i++) {
+        [g_metal.yTex[i] replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:black_y bytesPerRow:w];
+        [g_metal.uTex[i] replaceRegion:MTLRegionMake2D(0, 0, w / 2, h / 2) mipmapLevel:0 withBytes:gray_uv bytesPerRow:w / 2];
+        [g_metal.vTex[i] replaceRegion:MTLRegionMake2D(0, 0, w / 2, h / 2) mipmapLevel:0 withBytes:gray_uv bytesPerRow:w / 2];
+    }
+    g_metal.has_frame = true; // Enables rendering immediately on launch
+    pthread_mutex_unlock(&g_metal.tex_lock);
+
+    free(black_y);
+    free(gray_uv);
 }
 
 static void metal_upload_yuv420p_frame(AVFrame *frame) {
@@ -357,6 +378,13 @@ static void handle_crsf_frame(const uint8_t *f, int len) {
     const uint8_t *payload = &f[1];
     int payload_len = len - 2;
 
+    static double last_p = 0;
+    if (now_seconds() - last_p > 0.5) {
+        last_p = now_seconds();
+        printf("[mac] CRSF frame received: Type 0x%02X, len=%d\n", type, len);
+    }
+
+    
     pthread_mutex_lock(&g_telem_lock);
     switch (type) {
     case CRSF_FRAMETYPE_ATTITUDE:
@@ -506,6 +534,7 @@ static pthread_mutex_t g_q_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_q_cond = PTHREAD_COND_INITIALIZER;
 
 static uint64_t g_pkt_no, g_frame_no;
+static volatile double g_last_video_render_time = 0;
 static double   g_t0;
 static double   g_sum_dec, g_sum_up, g_sum_rend, g_max_rend, g_sum_nd;
 
@@ -555,6 +584,7 @@ static void *decode_render_thread_fn(void *arg) {
                         av_frame_unref(dec.frame);
 
                         if (g_metal_view) {
+                            g_last_video_render_time = now_seconds();
                             [g_metal_view renderFrame];
                         }
                     }
@@ -1190,6 +1220,9 @@ int main(int argc, char **argv) {
         g_metal_view = metalView;
         metalView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
 
+        // Initialize clean black textures and size HUD texture to screen backing
+        metal_init_black_textures();
+
         fprintf(stderr, "[mac] screen max refresh: %ld Hz\n",
                 (long)[[NSScreen mainScreen] maximumFramesPerSecond]);
 
@@ -1197,10 +1230,17 @@ int main(int argc, char **argv) {
         [window makeKeyAndOrderFront:nil];
         [NSApp activateIgnoringOtherApps:YES];
 
-        /* Update HUD at 60Hz into the Metal texture with zero compositor penalty */
+        /* Update HUD at 60Hz into the Metal texture and present if video is idle/lost */
         [NSTimer scheduledTimerWithTimeInterval:0.016 repeats:YES block:^(NSTimer *timer) {
             (void)timer;
             render_hud_to_texture();
+
+            // If no video frame was presented in the last 20ms, present HUD now
+            if (now_seconds() - g_last_video_render_time > 0.020) {
+                if (g_metal_view) {
+                    [g_metal_view renderFrame];
+                }
+            }
         }];
 
         pthread_t video_tid, serial_tid;
