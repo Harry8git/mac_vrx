@@ -250,6 +250,8 @@ static float clampf(float v, float lo, float hi) {
 typedef struct {
     float roll, pitch, yaw;
     float throttle;
+    float cam_pan;   // -1.0 (left) to +1.0 (right), 0.0 is center
+    float cam_tilt;  // -1.0 (down) to +1.0 (up),    0.0 is center
     bool  armed;
     bool  rtl;
     int   flight_mode;
@@ -263,6 +265,8 @@ typedef struct {
     bool pitch_down, pitch_up;
     bool yaw_left, yaw_right;
     bool throttle_up, throttle_down;
+    bool cam_pan_left, cam_pan_right;
+    bool cam_tilt_up, cam_tilt_down;
 } sim_keys_t;
 
 static sim_keys_t g_keys = {0};
@@ -299,6 +303,7 @@ static telem_data_t telem_get_snapshot(void) {
 static void ctrl_center(void) {
     pthread_mutex_lock(&g_ctrl_lock);
     g_ctrl.roll = g_ctrl.pitch = g_ctrl.yaw = 0.0f;
+    g_ctrl.cam_pan = g_ctrl.cam_tilt = 0.0f; // Re-center camera on 'C' key
     pthread_mutex_unlock(&g_ctrl_lock);
 }
 
@@ -348,11 +353,12 @@ static int crsf_build_rc_frame(ctrl_state_t s, uint8_t out[26]) {
     ch[1] = encode_axis(s.pitch);
     ch[2] = encode_throttle(s.throttle);
     ch[3] = encode_axis(s.yaw);
-    ch[4] = s.armed ? 1811 : 172;
-    ch[5] = 992;
-    ch[6] = s.rtl ? 1811 : 172;
-    ch[7] = (s.flight_mode == 1) ? 172 : ((s.flight_mode == 2) ? 992 : 1811);
-    for (int i = 8; i < 16; i++) ch[i] = 992;
+    ch[4] = s.armed ? 1811 : 172;                     // CH 5: Arm
+    ch[5] = encode_axis(s.cam_pan);                   // CH 6: Camera Pan
+    ch[6] = s.rtl ? 1811 : 172;                       // CH 7: RTL
+    ch[7] = (s.flight_mode == 1) ? 172 : ((s.flight_mode == 2) ? 500 : 827); // CH 8: Flight Mode
+    ch[8] = encode_axis(s.cam_tilt);                  // CH 9: Camera Tilt
+    for (int i = 9; i < 16; i++) ch[i] = 992;         // CH 10..16: Neutral
 
     out[0] = CRSF_SYNC_FC;
     out[1] = 22 + 2;
@@ -780,8 +786,15 @@ static void *serial_thread_fn(void *arg) {
 
             if (g_keys.throttle_up)   g_ctrl.throttle = clampf(g_ctrl.throttle + THROTTLE_RATE * (float)dt, 0.0f, 1.0f);
             if (g_keys.throttle_down) g_ctrl.throttle = clampf(g_ctrl.throttle - THROTTLE_RATE * (float)dt, 0.0f, 1.0f);
-            pthread_mutex_unlock(&g_ctrl_lock);
 
+            // Slew camera pan/tilt smoothly while keys are held
+            float cam_speed = 1.5f; // Slew rate (full travel across in ~1.3 sec)
+            if (g_keys.cam_pan_left)   g_ctrl.cam_pan  = clampf(g_ctrl.cam_pan  - cam_speed * (float)dt, -1.0f, 1.0f);
+            if (g_keys.cam_pan_right)  g_ctrl.cam_pan  = clampf(g_ctrl.cam_pan  + cam_speed * (float)dt, -1.0f, 1.0f);
+            if (g_keys.cam_tilt_down)  g_ctrl.cam_tilt = clampf(g_ctrl.cam_tilt - cam_speed * (float)dt, -1.0f, 1.0f);
+            if (g_keys.cam_tilt_up)    g_ctrl.cam_tilt = clampf(g_ctrl.cam_tilt + cam_speed * (float)dt, -1.0f, 1.0f);
+
+            pthread_mutex_unlock(&g_ctrl_lock);
             last_physics_t = t;
         }
 
@@ -796,12 +809,12 @@ static void *serial_thread_fn(void *arg) {
             write(fd, tx_frame, len);
         }
 
-        if (t - last_link_t >= 0.1) {
+        /* if (t - last_link_t >= 0.1) {
             last_link_t = t;
             uint8_t link_frame[14];
             int l_len = crsf_build_link_stats_frame(link_frame);
             write(fd, link_frame, l_len);
-        }
+        } */
 
         usleep(1000);
     }
@@ -1139,6 +1152,12 @@ static void render_hud_to_texture(void) {
         case kVK_LeftArrow:    g_keys.roll_left     = true; break;
         case kVK_RightArrow:   g_keys.roll_right    = true; break;
 
+        // --- Camera Pan/Tilt Keydown ---
+        case kVK_ANSI_J:       g_keys.cam_pan_left  = true; break; // Pan Left
+        case kVK_ANSI_L:       g_keys.cam_pan_right = true; break; // Pan Right
+        case kVK_ANSI_I:       g_keys.cam_tilt_up   = true; break; // Tilt Up
+        case kVK_ANSI_K:       g_keys.cam_tilt_down = true; break; // Tilt Down
+
         case kVK_ANSI_1: case kVK_ANSI_2: case kVK_ANSI_3: {
             pthread_mutex_lock(&g_ctrl_lock);
             g_ctrl.flight_mode = (code == kVK_ANSI_1) ? 1 : ((code == kVK_ANSI_2) ? 2 : 3);
@@ -1161,7 +1180,7 @@ static void render_hud_to_texture(void) {
             }
             break;
 
-        case kVK_ANSI_C:       ctrl_center(); break;
+        case kVK_ANSI_C:       ctrl_center(); break; // Re-center sticks & camera
         case kVK_ANSI_F:       [self toggleFullscreenMode]; break;
         case kVK_Escape:
             g_quit = 1;
@@ -1184,6 +1203,12 @@ static void render_hud_to_texture(void) {
         case kVK_DownArrow:    g_keys.pitch_up      = false; break;
         case kVK_LeftArrow:    g_keys.roll_left     = false; break;
         case kVK_RightArrow:   g_keys.roll_right    = false; break;
+
+        // --- Camera Pan/Tilt Keyup ---
+        case kVK_ANSI_J:       g_keys.cam_pan_left  = false; break;
+        case kVK_ANSI_L:       g_keys.cam_pan_right = false; break;
+        case kVK_ANSI_I:       g_keys.cam_tilt_up   = false; break;
+        case kVK_ANSI_K:       g_keys.cam_tilt_down = false; break;
 
         default: [super keyUp:event]; break;
     }
