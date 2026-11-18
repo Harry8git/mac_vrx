@@ -53,6 +53,7 @@
 #define CRSF_FRAMETYPE_RC_CHANNELS 0x16
 #define CRSF_FRAMETYPE_ATTITUDE 0x1E
 #define CRSF_FRAMETYPE_FLIGHT_MODE 0x21
+#define CRSF_FRAMETYPE_BARO_VARIO 0x09
 
 #define DECAY_TAU_SEC           0.35f
 #define THROTTLE_RATE           0.50f
@@ -284,7 +285,9 @@ typedef struct {
     uint8_t  lq;
     double   latitude;
     double   longitude;
-    float    altitude_m;
+    float    altitude_m;      // Baro/EKF relative altitude (from 0x09)
+    float    gps_altitude_m;  // GPS MSL altitude (from 0x02)
+
     float    groundspeed_kmh;
     uint8_t  sats;
     char     flight_mode[16];
@@ -415,7 +418,7 @@ static void handle_crsf_frame(const uint8_t *f, int len) {
             g_telem.latitude        = (double)lat / 1e7;
             g_telem.longitude       = (double)lon / 1e7;
             g_telem.groundspeed_kmh = (uint16_t)((payload[8] << 8) | payload[9]) / 10.0f;
-            g_telem.altitude_m      = (int16_t)((payload[12] << 8) | payload[13]) - 1000.0f;
+            g_telem.gps_altitude_m  = (uint16_t)((payload[12] << 8) | payload[13]) - 1000.0f;
             g_telem.sats            = payload[14];
         }
         break;
@@ -431,6 +434,16 @@ static void handle_crsf_frame(const uint8_t *f, int len) {
         if (payload_len >= 4) {
             g_telem.rssi = (int8_t)payload[0];
             g_telem.lq   = payload[2];
+        }
+        break;
+    case CRSF_FRAMETYPE_BARO_VARIO:
+        if (payload_len >= 2) {
+            uint16_t raw_alt = ((uint16_t)payload[0] << 8) | payload[1];
+            if (raw_alt & 0x8000) {
+                g_telem.altitude_m = (float)(raw_alt & 0x7FFF);
+            } else {
+                g_telem.altitude_m = ((int32_t)raw_alt - 10000) / 10.0f;
+            }
         }
         break;
     }
@@ -954,7 +967,7 @@ static void render_hud_to_texture(void) {
                           telem.voltage, telem.current, telem.battery_pct, telem.mah, (int)(ctrl.throttle * 100.0f)];
     [osdPower drawAtPoint:CGPointMake(40, 20) withAttributes:attrGreen];
 
-    NSString *osdNav = [NSString stringWithFormat:@"ALT: %4.0fm  SPD: %3.0fkm/h  SATS: %2u  LAT: %9.5f LON: %9.5f",
+    NSString *osdNav = [NSString stringWithFormat:@"ALT: %5.1fm  SPD: %3.0fkm/h  SATS: %2u  LAT: %9.5f LON: %9.5f",
                         telem.altitude_m, telem.groundspeed_kmh, telem.sats, telem.latitude, telem.longitude];
     CGSize navSize = [osdNav sizeWithAttributes:attrGreen];
     [osdNav drawAtPoint:CGPointMake(w - navSize.width - 40, 20) withAttributes:attrGreen];
