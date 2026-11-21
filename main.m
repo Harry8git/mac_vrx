@@ -19,6 +19,7 @@
 #include <time.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <math.h>
 #include <pthread.h>
 #include <fcntl.h>
@@ -130,14 +131,16 @@ typedef struct {
     id<MTLDevice>              device;
     id<MTLCommandQueue>        commandQueue;
     id<MTLRenderPipelineState> pipelineState;
-    id<MTLTexture>             yTex[2];
-    id<MTLTexture>             uTex[2];
-    id<MTLTexture>             vTex[2];
-    id<MTLTexture>             hudTex;
+    id<MTLTexture>             yTex[3];
+    id<MTLTexture>             uTex[3];
+    id<MTLTexture>             vTex[3];
+    id<MTLTexture>             hudTex[2];
+    int                        activeHudIdx;
     int                        activeIdx;
     int                        width;
     int                        height;
     pthread_mutex_t            tex_lock;
+    pthread_mutex_t            render_lock;
     bool                       has_frame;
 } metal_video_pipeline_t;
 
@@ -148,6 +151,7 @@ static int metal_pipeline_init(id<MTLDevice> device) {
     g_metal.device = device;
     g_metal.commandQueue = [device newCommandQueue];
     pthread_mutex_init(&g_metal.tex_lock, NULL);
+    pthread_mutex_init(&g_metal.render_lock, NULL);
 
     NSError *error = nil;
     NSString *src = [NSString stringWithUTF8String:kMetalShaderSource];
@@ -171,7 +175,7 @@ static void ensure_textures(int w, int h) {
         g_metal.width = w;
         g_metal.height = h;
 
-        for (int i = 0; i < 2; i++) {
+        for (int i = 0; i < 3; i++) {
             MTLTextureDescriptor *yd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm width:w height:h mipmapped:NO];
             yd.usage = MTLTextureUsageShaderRead;
             yd.storageMode = MTLStorageModeShared;
@@ -195,7 +199,7 @@ static void metal_init_black_textures(void) {
     memset(gray_uv, 128, (w / 2) * (h / 2));
 
     pthread_mutex_lock(&g_metal.tex_lock);
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 3; i++) {
         [g_metal.yTex[i] replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:black_y bytesPerRow:w];
         [g_metal.uTex[i] replaceRegion:MTLRegionMake2D(0, 0, w / 2, h / 2) mipmapLevel:0 withBytes:gray_uv bytesPerRow:w / 2];
         [g_metal.vTex[i] replaceRegion:MTLRegionMake2D(0, 0, w / 2, h / 2) mipmapLevel:0 withBytes:gray_uv bytesPerRow:w / 2];
@@ -208,14 +212,14 @@ static void metal_init_black_textures(void) {
 }
 
 static void metal_upload_yuv420p_frame(AVFrame *frame) {
-    if (frame->format != AV_PIX_FMT_YUV420P) return;
+    if (frame->format != AV_PIX_FMT_YUV420P && frame->format != AV_PIX_FMT_YUVJ420P) return;
 
     pthread_mutex_lock(&g_metal.tex_lock);
     int w = frame->width;
     int h = frame->height;
     ensure_textures(w, h);
 
-    int writeIdx = 1 - g_metal.activeIdx;
+    int writeIdx = (g_metal.activeIdx + 1) % 3;
     [g_metal.yTex[writeIdx] replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:frame->data[0] bytesPerRow:frame->linesize[0]];
     [g_metal.uTex[writeIdx] replaceRegion:MTLRegionMake2D(0, 0, w / 2, h / 2) mipmapLevel:0 withBytes:frame->data[1] bytesPerRow:frame->linesize[1]];
     [g_metal.vTex[writeIdx] replaceRegion:MTLRegionMake2D(0, 0, w / 2, h / 2) mipmapLevel:0 withBytes:frame->data[2] bytesPerRow:frame->linesize[2]];
@@ -277,7 +281,7 @@ typedef struct {
     float    current;
     uint32_t mah;
     uint8_t  battery_pct;
-    int8_t   rssi;
+    uint8_t  rssi;
     uint8_t  lq;
     double   latitude;
     double   longitude;
@@ -370,16 +374,6 @@ static int crsf_build_rc_frame(ctrl_state_t s, uint8_t out[26]) {
     return 26;
 }
 
-static int crsf_build_link_stats_frame(uint8_t out[14]) {
-    out[0] = CRSF_SYNC_FC;
-    out[1] = 10 + 2;
-    out[2] = CRSF_FRAMETYPE_LINK_STAT;
-    out[3] = 45; out[4] = 45; out[5] = 100; out[6] = 10;
-    out[7] = 0;  out[8] = 2;
-    out[9] = 0;  out[10] = 45; out[11] = 100; out[12] = 10;
-    out[13] = crsf_crc8(&out[2], 1 + 10);
-    return 14;
-}
 
 static void handle_crsf_frame(const uint8_t *f, int len) {
     uint8_t type = f[0];
@@ -438,7 +432,7 @@ static void handle_crsf_frame(const uint8_t *f, int len) {
     }
     case CRSF_FRAMETYPE_LINK_STAT:
         if (payload_len >= 4) {
-            g_telem.rssi = (int8_t)payload[0];
+            g_telem.rssi = payload[0];
             g_telem.lq   = payload[2];
         }
         break;
@@ -491,7 +485,6 @@ static void crsf_parser_feed(crsf_parser_t *p, uint8_t byte) {
 typedef struct {
     const AVCodec        *codec;
     AVCodecContext       *ctx;
-    AVCodecParserContext *parser;
     AVFrame              *frame;
     AVPacket             *pkt;
 } hevc_decoder_t;
@@ -573,9 +566,8 @@ static int hevc_decoder_init(hevc_decoder_t *dec) {
     if (!dec->codec) return -1;
 
     av_log_set_level(AV_LOG_INFO);
-    dec->parser = av_parser_init(dec->codec->id);
     dec->ctx    = avcodec_alloc_context3(dec->codec);
-    if (!dec->parser || !dec->ctx) return -1;
+    if (!dec->ctx) return -1;
 
     dec->ctx->flags  |= AV_CODEC_FLAG_LOW_DELAY;
     dec->ctx->flags2 |= AV_CODEC_FLAG2_FAST;
@@ -611,11 +603,10 @@ static void hevc_decoder_destroy(hevc_decoder_t *dec) {
     if (dec->frame)  av_frame_free(&dec->frame);
     if (dec->pkt)    av_packet_free(&dec->pkt);
     if (dec->ctx)    avcodec_free_context(&dec->ctx);
-    if (dec->parser) av_parser_close(dec->parser);
 }
 
 /* ---------------- Queue Configuration ---------------- */
-#define QUEUE_CAP          128
+#define QUEUE_CAP          32
 #define QUEUE_SLOT_SIZE    BUFFER_SIZE
 
 typedef struct {
@@ -630,9 +621,7 @@ static int             g_q_count = 0;
 static pthread_mutex_t g_q_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_q_cond = PTHREAD_COND_INITIALIZER;
 
-static volatile double g_last_video_render_time = 0;
-static double   g_t0;
-static double   g_sum_nd;
+static _Atomic double g_last_video_render_time = 0.0;
 
 static void *decode_render_thread_fn(void *arg) {
     (void)arg;
@@ -649,7 +638,7 @@ static void *decode_render_thread_fn(void *arg) {
         return NULL;
     }
 
-    au_buf[0] = 0x00; au_buf[1] = 0x00; au_buf[2] = 0x00; au_buf[3] = 0x01;
+    bool   synced    = false;
     size_t au_len    = 4;
     size_t nal_start = 4;
     int    zero_run  = 0;
@@ -675,15 +664,28 @@ static void *decode_render_thread_fn(void *arg) {
         for (uint32_t i = 0; i < size && !g_quit; i++) {
             uint8_t b = data[i];
 
-            /* Skip optional trailing 0x00 short-packet pad between frames */
-            if (au_len == nal_start && b == 0x00) {
+            /* Wait for first Annex B start code before recording bytes */
+            if (!synced) {
+                if (b == 0x00) {
+                    zero_run++;
+                } else if (b == 0x01 && zero_run >= 2) {
+                    synced = true;
+                    au_buf[0] = 0x00; au_buf[1] = 0x00; au_buf[2] = 0x00; au_buf[3] = 0x01;
+                    au_len    = 4;
+                    nal_start = 4;
+                    zero_run  = 0;
+                } else {
+                    zero_run = 0;
+                }
                 continue;
             }
 
             if (au_len >= MAX_AU_PAYLOAD) {
-                au_len = 4;
+                fprintf(stderr, "[decode] AU overflow (>%d bytes), resyncing\n", MAX_AU_PAYLOAD);
+                synced    = false;
+                au_len    = 4;
                 nal_start = 4;
-                zero_run = 0;
+                zero_run  = 0;
                 continue;
             }
 
@@ -691,20 +693,33 @@ static void *decode_render_thread_fn(void *arg) {
 
             if (b == 0x00) {
                 zero_run++;
-            } else if (b == 0x01 && zero_run >= 3) {
+            } else if (b == 0x01 && zero_run >= 2) {
+                size_t sc_len  = (zero_run >= 3) ? 4 : 3;
+                size_t nal_end = au_len - sc_len;
                 zero_run = 0;
 
-                size_t nal_end  = au_len - 4;
-                size_t nal_len  = (nal_end > nal_start) ? (nal_end - nal_start) : 0;
-                uint8_t nal_type = (nal_len > 0) ? ((au_buf[nal_start] >> 1) & 0x3F) : 0;
-
-                /* If this was VPS(32)/SPS(33)/PPS(34), keep accumulating until the slice arrives */
-                if ((nal_type == 32 || nal_type == 33 || nal_type == 34) && nal_len <= 128) {
-                    nal_start = au_len;
+                size_t nal_len   = (nal_end > nal_start) ? (nal_end - nal_start) : 0;
+                if (nal_len == 0) {
+                    au_len = nal_start;
                     continue;
                 }
 
-                /* VCL slice (or corrupted fragment) complete -> decode immediately! */
+                uint8_t nal_type = (au_buf[nal_start] >> 1) & 0x3F;
+
+                /* Keep accumulating non-VCL NALs (VPS=32, SPS=33, PPS=34, AUD=35, SEI=39/40) */
+                if (nal_type >= 32 && nal_len <= 512) {
+                    if (nal_end + 4 <= MAX_AU_PAYLOAD) {
+                        au_buf[nal_end + 0] = 0x00;
+                        au_buf[nal_end + 1] = 0x00;
+                        au_buf[nal_end + 2] = 0x00;
+                        au_buf[nal_end + 3] = 0x01;
+                        au_len    = nal_end + 4;
+                        nal_start = au_len;
+                        continue;
+                    }
+                }
+
+                /* VCL slice complete -> decode immediately */
                 if (nal_end > 4) {
                     memset(au_buf + nal_end, 0, AV_INPUT_BUFFER_PADDING_SIZE);
                     maybe_latch_hevc_hdr(au_buf, nal_end);
@@ -718,7 +733,7 @@ static void *decode_render_thread_fn(void *arg) {
                             av_frame_unref(dec.frame);
 
                             if (g_metal_view) {
-                                g_last_video_render_time = now_seconds();
+                                atomic_store(&g_last_video_render_time, now_seconds());
                                 [g_metal_view renderFrame];
                             }
                         }
@@ -727,6 +742,7 @@ static void *decode_render_thread_fn(void *arg) {
                     dec.pkt->size = 0;
                 }
 
+                au_buf[0] = 0x00; au_buf[1] = 0x00; au_buf[2] = 0x00; au_buf[3] = 0x01;
                 au_len    = 4;
                 nal_start = 4;
             } else {
@@ -818,12 +834,15 @@ static void *video_thread_fn(void *arg) {
             }
 
             if (ret == 0 && actual > 0) {
-                if (g_t0 == 0) g_t0 = now_seconds();
-
                 pthread_mutex_lock(&g_q_lock);
-                while (g_q_count >= 20) {
-                    g_q_tail = (g_q_tail + 1) % QUEUE_CAP;
-                    g_q_count--;
+                if (g_q_count >= 20) {
+                    int dropped = 0;
+                    while (g_q_count >= 20) {
+                        g_q_tail = (g_q_tail + 1) % QUEUE_CAP;
+                        g_q_count--;
+                        dropped++;
+                    }
+                    fprintf(stderr, "[video] WARNING: decode queue overflow, dropped %d chunk(s)\n", dropped);
                 }
 
                 uint32_t copy_len = (actual > QUEUE_SLOT_SIZE) ? QUEUE_SLOT_SIZE : (uint32_t)actual;
@@ -844,7 +863,9 @@ static void *video_thread_fn(void *arg) {
     }
 
     g_quit = 1;
+    pthread_mutex_lock(&g_q_lock);
     pthread_cond_broadcast(&g_q_cond);
+    pthread_mutex_unlock(&g_q_lock);
     pthread_join(dec_tid, NULL);
 
     free(usb_buffer);
@@ -861,8 +882,6 @@ static void *serial_thread_fn(void *arg) {
     int fd = -1;
     double last_tx_t = now_seconds();
     double last_physics_t = now_seconds();
-    double last_link_t = now_seconds();
-    (void)last_link_t;
 
     while (!g_quit) {
         if (fd < 0) {
@@ -880,6 +899,8 @@ static void *serial_thread_fn(void *arg) {
                 tty.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);
                 tty.c_iflag &= ~(IXON | IXOFF | IXANY);
                 tty.c_oflag &= ~OPOST;
+                tty.c_cc[VMIN]  = 1;
+                tty.c_cc[VTIME] = 0;
                 tcsetattr(fd, TCSANOW, &tty);
                 int modem_ctrl = TIOCM_DTR | TIOCM_RTS;
                 ioctl(fd, TIOCMBIS, &modem_ctrl);
@@ -892,7 +913,8 @@ static void *serial_thread_fn(void *arg) {
         while ((n = read(fd, rx_buf, sizeof(rx_buf))) > 0) {
             for (ssize_t i = 0; i < n; i++) crsf_parser_feed(&parser, rx_buf[i]);
         }
-        if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+        if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
+            fprintf(stderr, "[serial] Disconnected from %s\n", g_serial_dev_path);
             close(fd);
             fd = -1;
             continue;
@@ -901,12 +923,13 @@ static void *serial_thread_fn(void *arg) {
         double t = now_seconds();
         double dt = t - last_physics_t;
         if (dt >= 0.01) {
-            float target_roll  = (g_keys.roll_right ? 1.0f : 0.0f) - (g_keys.roll_left ? 1.0f : 0.0f);
-            float target_pitch = (g_keys.pitch_up   ? 1.0f : 0.0f) - (g_keys.pitch_down ? 1.0f : 0.0f);
-            float target_yaw   = (g_keys.yaw_right  ? 1.0f : 0.0f) - (g_keys.yaw_left   ? 1.0f : 0.0f);
             float blend = 1.0f - expf((float)(-dt / DECAY_TAU_SEC));
 
             pthread_mutex_lock(&g_ctrl_lock);
+            float target_roll  = (g_keys.roll_right ? 1.0f : 0.0f) - (g_keys.roll_left ? 1.0f : 0.0f);
+            float target_pitch = (g_keys.pitch_up   ? 1.0f : 0.0f) - (g_keys.pitch_down ? 1.0f : 0.0f);
+            float target_yaw   = (g_keys.yaw_right  ? 1.0f : 0.0f) - (g_keys.yaw_left   ? 1.0f : 0.0f);
+
             g_ctrl.roll  += (target_roll  - g_ctrl.roll)  * blend;
             g_ctrl.pitch += (target_pitch - g_ctrl.pitch) * blend;
             g_ctrl.yaw   += (target_yaw   - g_ctrl.yaw)   * blend;
@@ -919,8 +942,8 @@ static void *serial_thread_fn(void *arg) {
             if (g_keys.cam_pan_right)  g_ctrl.cam_pan  = clampf(g_ctrl.cam_pan  + cam_speed * (float)dt, -1.0f, 1.0f);
             if (g_keys.cam_tilt_down)  g_ctrl.cam_tilt = clampf(g_ctrl.cam_tilt - cam_speed * (float)dt, -1.0f, 1.0f);
             if (g_keys.cam_tilt_up)    g_ctrl.cam_tilt = clampf(g_ctrl.cam_tilt + cam_speed * (float)dt, -1.0f, 1.0f);
-
             pthread_mutex_unlock(&g_ctrl_lock);
+
             last_physics_t = t;
         }
 
@@ -932,10 +955,15 @@ static void *serial_thread_fn(void *arg) {
 
             uint8_t tx_frame[26];
             int len = crsf_build_rc_frame(current, tx_frame);
-            write(fd, tx_frame, len);
+            ssize_t wn = write(fd, tx_frame, len);
+            if (wn < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                fprintf(stderr, "[serial] Write error (%s), disconnecting\n", strerror(errno));
+                close(fd);
+                fd = -1;
+                continue;
+            }
         }
 
-        (void)crsf_build_link_stats_frame;
         usleep(1000);
     }
 
@@ -961,9 +989,16 @@ static void hud_stroke_backed(CGContextRef ctx, CGColorRef fg, CGColorRef shadow
     CGPathRelease(path);
 }
 
+static float wrap_delta_deg(float delta) {
+    delta = fmodf(delta + 180.0f, 360.0f);
+    if (delta < 0.0f) delta += 360.0f;
+    return delta - 180.0f;
+}
+
 static void render_hud_to_texture(void) {
     if (!g_metal_view) return;
 
+    @autoreleasepool {
     CGFloat scale = g_metal_view.window.backingScaleFactor ?: [[NSScreen mainScreen] backingScaleFactor];
     NSSize viewSize = g_metal_view.bounds.size;
     CGFloat w = viewSize.width;
@@ -979,7 +1014,7 @@ static void render_hud_to_texture(void) {
     if (s_buf_w != pixel_w || s_buf_h != pixel_h) {
         if (s_cached_ctx) { CGContextRelease(s_cached_ctx); s_cached_ctx = NULL; }
         free(s_hud_pixels);
-        s_hud_pixels = (uint32_t *)calloc(pixel_w * pixel_h, sizeof(uint32_t));
+        s_hud_pixels = (uint32_t *)calloc((size_t)pixel_w * pixel_h, sizeof(uint32_t));
         s_buf_w = pixel_w; s_buf_h = pixel_h;
 
         CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
@@ -996,48 +1031,101 @@ static void render_hud_to_texture(void) {
                                                                                         width:pixel_w height:pixel_h mipmapped:NO];
         hudd.usage = MTLTextureUsageShaderRead;
         hudd.storageMode = MTLStorageModeShared;
-        id<MTLTexture> newHudTex = [g_metal.device newTextureWithDescriptor:hudd];
+        id<MTLTexture> tex0 = [g_metal.device newTextureWithDescriptor:hudd];
+        id<MTLTexture> tex1 = [g_metal.device newTextureWithDescriptor:hudd];
+
         pthread_mutex_lock(&g_metal.tex_lock);
-        g_metal.hudTex = newHudTex;
+        g_metal.hudTex[0] = tex0;
+        g_metal.hudTex[1] = tex1;
+        g_metal.activeHudIdx = 0;
         pthread_mutex_unlock(&g_metal.tex_lock);
     } else {
-        memset(s_hud_pixels, 0, pixel_w * pixel_h * sizeof(uint32_t));
+        memset(s_hud_pixels, 0, (size_t)pixel_w * pixel_h * sizeof(uint32_t));
     }
 
     CGContextRef ctx = s_cached_ctx;
     if (!ctx) return;
 
+    static NSColor      *s_colPri    = nil;
+    static CGColorRef    s_cgPri     = NULL;
+    static CGColorRef    s_cgShad    = NULL;
+    static CGColorRef    s_cgBg      = NULL;
+    static NSDictionary *s_attrPri   = nil;
+    static NSDictionary *s_attrSmall = nil;
+
+    if (!s_colPri) {
 #if HUD_COLOR_THEME == 1
-    const CGFloat HUD_R = 1.00, HUD_G = 0.15, HUD_B = 0.85; /* Magenta */
+        const CGFloat HUD_R = 1.00, HUD_G = 0.15, HUD_B = 0.85; /* Magenta */
 #else
-    const CGFloat HUD_R = 0.00, HUD_G = 1.00, HUD_B = 0.40; /* Green */
+        const CGFloat HUD_R = 0.00, HUD_G = 1.00, HUD_B = 0.40; /* Green */
 #endif
+        s_colPri = [NSColor colorWithCalibratedRed:HUD_R green:HUD_G blue:HUD_B alpha:1.0];
+        s_cgPri  = CGColorRetain(s_colPri.CGColor);
+        s_cgShad = CGColorRetain([NSColor colorWithCalibratedWhite:0.0 alpha:0.75].CGColor);
+        s_cgBg   = CGColorRetain([NSColor colorWithCalibratedRed:0.0 green:0.0 blue:0.0 alpha:0.35].CGColor);
 
-    NSColor *colPri   = [NSColor colorWithCalibratedRed:HUD_R green:HUD_G blue:HUD_B alpha:1.0];
-    CGColorRef cgPri  = colPri.CGColor;
-    CGColorRef cgShad = [NSColor colorWithCalibratedWhite:0.0 alpha:0.75].CGColor;
-    CGColorRef cgBg   = [NSColor colorWithCalibratedRed:0.0 green:0.0 blue:0.0 alpha:0.35].CGColor;
+        NSShadow *textShadow = [[NSShadow alloc] init];
+        textShadow.shadowColor = [NSColor colorWithCalibratedWhite:0.0 alpha:0.9];
+        textShadow.shadowOffset = NSMakeSize(1.0, -1.0);
+        textShadow.shadowBlurRadius = 1.0;
 
-    NSShadow *textShadow = [[NSShadow alloc] init];
-    textShadow.shadowColor = [NSColor colorWithCalibratedWhite:0.0 alpha:0.9];
-    textShadow.shadowOffset = NSMakeSize(1.0, -1.0);
-    textShadow.shadowBlurRadius = 1.0;
+        s_attrPri = @{
+            NSFontAttributeName: [NSFont monospacedSystemFontOfSize:13.5 weight:NSFontWeightBold],
+            NSForegroundColorAttributeName: s_colPri, NSShadowAttributeName: textShadow
+        };
+        s_attrSmall = @{
+            NSFontAttributeName: [NSFont monospacedSystemFontOfSize:10.5 weight:NSFontWeightBold],
+            NSForegroundColorAttributeName: s_colPri, NSShadowAttributeName: textShadow
+        };
+#if !__has_feature(objc_arc)
+        [s_colPri retain];
+        [s_attrPri retain];
+        [s_attrSmall retain];
+        [textShadow release];
+#endif
+    }
 
-    NSDictionary *attrPri = @{
-        NSFontAttributeName: [NSFont monospacedSystemFontOfSize:13.5 weight:NSFontWeightBold],
-        NSForegroundColorAttributeName: colPri, NSShadowAttributeName: textShadow
-    };
-    NSDictionary *attrSmall = @{
-        NSFontAttributeName: [NSFont monospacedSystemFontOfSize:10.5 weight:NSFontWeightBold],
-        NSForegroundColorAttributeName: colPri, NSShadowAttributeName: textShadow
-    };
+    CGColorRef cgPri        = s_cgPri;
+    CGColorRef cgShad       = s_cgShad;
+    CGColorRef cgBg         = s_cgBg;
+    NSDictionary *attrPri   = s_attrPri;
+    NSDictionary *attrSmall = s_attrSmall;
 
     telem_data_t telem = telem_get_snapshot();
     pthread_mutex_lock(&g_ctrl_lock);
     ctrl_state_t ctrl = g_ctrl;
     pthread_mutex_unlock(&g_ctrl_lock);
 
-    float hdg = fmodf(telem.yaw_deg + 360.0f, 360.0f);
+    /* Smooth attitude interpolation (~45 ms time constant, zero-jump 360° wrap) */
+    const float ATT_SMOOTH_TAU_SEC = 0.045f;
+    static bool   s_att_init   = false;
+    static double s_att_last_t = 0.0;
+    static float  s_disp_pitch = 0.0f;
+    static float  s_disp_roll  = 0.0f;
+    static float  s_disp_hdg   = 0.0f;
+
+    double t_now = now_seconds();
+    float raw_hdg = fmodf(telem.yaw_deg + 360.0f, 360.0f);
+    if (!s_att_init) {
+        s_disp_pitch = telem.pitch_deg;
+        s_disp_roll  = telem.roll_deg;
+        s_disp_hdg   = raw_hdg;
+        s_att_init   = true;
+    } else {
+        float dt = (float)(t_now - s_att_last_t);
+        if (dt < 0.0f) dt = 0.0f;
+        if (dt > 0.1f) dt = 0.1f;
+        float alpha = 1.0f - expf(-dt / ATT_SMOOTH_TAU_SEC);
+
+        s_disp_pitch += wrap_delta_deg(telem.pitch_deg - s_disp_pitch) * alpha;
+        s_disp_roll  += wrap_delta_deg(telem.roll_deg  - s_disp_roll)  * alpha;
+        s_disp_hdg    = fmodf(s_disp_hdg + wrap_delta_deg(raw_hdg - s_disp_hdg) * alpha + 360.0f, 360.0f);
+    }
+    s_att_last_t = t_now;
+
+    float disp_pitch = s_disp_pitch;
+    float disp_roll  = s_disp_roll;
+    float hdg        = s_disp_hdg;
     double home_dist_m = 0.0;
     float home_rel_deg = 0.0f;
     if (telem.has_home) {
@@ -1058,8 +1146,8 @@ static void render_hud_to_texture(void) {
     /* 1. Center: Plain Broken Horizon + 120-Degree Clear-Center Crosshair */
     CGContextSaveGState(ctx);
     CGContextTranslateCTM(ctx, cx, cy);
-    CGContextRotateCTM(ctx, -telem.roll_deg * (CGFloat)M_PI / 180.0);
-    CGFloat pitchOffset = telem.pitch_deg * 6.0;
+    CGContextRotateCTM(ctx, -disp_roll * (CGFloat)M_PI / 180.0);
+    CGFloat pitchOffset = disp_pitch * 6.0;
     CGContextBeginPath(ctx);
     CGContextMoveToPoint(ctx, -135, pitchOffset); CGContextAddLineToPoint(ctx, -38, pitchOffset);
     CGContextMoveToPoint(ctx,   38, pitchOffset); CGContextAddLineToPoint(ctx, 135, pitchOffset);
@@ -1103,7 +1191,7 @@ static void render_hud_to_texture(void) {
     if (rollR > 60.0) {
         CGContextSaveGState(ctx);
         CGContextTranslateCTM(ctx, cx, cy);
-        CGContextRotateCTM(ctx, -telem.roll_deg * (CGFloat)M_PI / 180.0);
+        CGContextRotateCTM(ctx, -disp_roll * (CGFloat)M_PI / 180.0);
         CGContextBeginPath(ctx);
         for (int d = -45; d <= 45; d += 5) {
             CGFloat rad = (90.0 + d) * M_PI / 180.0;
@@ -1127,10 +1215,10 @@ static void render_hud_to_texture(void) {
     CGContextSaveGState(ctx);
     CGContextClipToRect(ctx, CGRectMake(pitchX - 4.0, cy - pitchH * 0.5, 62.0, pitchH));
     CGContextBeginPath(ctx);
-    int basePitch = ((int)floorf(telem.pitch_deg / 5.0f)) * 5;
+    int basePitch = ((int)floorf(disp_pitch / 5.0f)) * 5;
     for (int d = basePitch - 40; d <= basePitch + 40; d += 5) {
         if (d < -90 || d > 90) continue;
-        CGFloat y = cy + ((float)d - telem.pitch_deg) * pitchPxPerDeg;
+        CGFloat y = cy + ((float)d - disp_pitch) * pitchPxPerDeg;
         CGFloat tick = (d == 0) ? 14.0 : ((d % 10 == 0) ? 10.0 : 5.0);
         CGContextMoveToPoint(ctx, pitchX, y);
         CGContextAddLineToPoint(ctx, pitchX + tick, y);
@@ -1153,7 +1241,7 @@ static void render_hud_to_texture(void) {
     CGContextFillRect(ctx, pBox);
     CGContextBeginPath(ctx); CGContextAddRect(ctx, pBox);
     hud_stroke_backed(ctx, cgPri, cgShad, 1.1);
-    NSString *pVal = [NSString stringWithFormat:@"%+3d°", (int)roundf(telem.pitch_deg)];
+    NSString *pVal = [NSString stringWithFormat:@"%+3d°", (int)roundf(disp_pitch)];
     [pVal drawAtPoint:CGPointMake(pitchX + 6.0, cy - 6.5) withAttributes:attrSmall];
 
     /* 5. Bottom-Center: Minimal Edge Heading Tape (±60°, readout overlaps tape) */
@@ -1213,7 +1301,7 @@ static void render_hud_to_texture(void) {
 
     /* 6. Top & Bottom Telemetry Text */
     const char *mode = ctrl.rtl ? "RTL-ACTIVE" : (ctrl.flight_mode == 1 ? "MAN" : (ctrl.flight_mode == 2 ? "STAB" : "FBWA"));
-    NSString *osdTop = [NSString stringWithFormat:@"%s [%s]  %s   LQ:%u%%  RSSI:-%ddBm",
+    NSString *osdTop = [NSString stringWithFormat:@"%s [%s]  %s   LQ:%u%%  RSSI:-%udBm",
                         telem.flight_mode, mode, ctrl.armed ? "ARMED" : "DISARMED",
                         telem.lq, telem.rssi];
     [osdTop drawAtPoint:CGPointMake(36, h - 36) withAttributes:attrPri];
@@ -1242,13 +1330,23 @@ static void render_hud_to_texture(void) {
     CGContextRestoreGState(ctx);
 
     pthread_mutex_lock(&g_metal.tex_lock);
-    if (g_metal.hudTex && [g_metal.hudTex width] == (NSUInteger)pixel_w && [g_metal.hudTex height] == (NSUInteger)pixel_h) {
-        [g_metal.hudTex replaceRegion:MTLRegionMake2D(0, 0, pixel_w, pixel_h)
-                          mipmapLevel:0
-                            withBytes:s_hud_pixels
-                          bytesPerRow:pixel_w * 4];
-    }
+    int writeHudIdx = 1 - g_metal.activeHudIdx;
+    id<MTLTexture> targetHud = g_metal.hudTex[writeHudIdx];
     pthread_mutex_unlock(&g_metal.tex_lock);
+
+    if (targetHud && [targetHud width] == (NSUInteger)pixel_w && [targetHud height] == (NSUInteger)pixel_h) {
+        [targetHud replaceRegion:MTLRegionMake2D(0, 0, pixel_w, pixel_h)
+                     mipmapLevel:0
+                       withBytes:s_hud_pixels
+                     bytesPerRow:pixel_w * 4];
+
+        pthread_mutex_lock(&g_metal.tex_lock);
+        if (g_metal.hudTex[writeHudIdx] == targetHud) {
+            g_metal.activeHudIdx = writeHudIdx;
+        }
+        pthread_mutex_unlock(&g_metal.tex_lock);
+    }
+    } /* @autoreleasepool */
 }
 
 /* ================================================================
@@ -1294,28 +1392,35 @@ static void render_hud_to_texture(void) {
 }
 
 - (void)updateDrawableSize {
+    pthread_mutex_lock(&g_metal.render_lock);
     CGFloat scale = self.window.backingScaleFactor ?: [[NSScreen mainScreen] backingScaleFactor];
     self.metalLayer.contentsScale = scale;
     CGSize pixelSize = [self convertSizeToBacking:self.bounds.size];
     if (pixelSize.width > 0 && pixelSize.height > 0) {
         self.metalLayer.drawableSize = pixelSize;
     }
+    pthread_mutex_unlock(&g_metal.render_lock);
 }
 
 - (void)renderFrame {
+    pthread_mutex_lock(&g_metal.render_lock);
+
     pthread_mutex_lock(&g_metal.tex_lock);
     if (!g_metal.has_frame || !g_metal.yTex[g_metal.activeIdx]) {
         pthread_mutex_unlock(&g_metal.tex_lock);
+        pthread_mutex_unlock(&g_metal.render_lock);
         return;
     }
     int idx = g_metal.activeIdx;
-    id<MTLTexture> y = g_metal.yTex[idx], u = g_metal.uTex[idx], v = g_metal.vTex[idx], hud = g_metal.hudTex;
+    id<MTLTexture> y = g_metal.yTex[idx], u = g_metal.uTex[idx], v = g_metal.vTex[idx];
+    id<MTLTexture> hud = g_metal.hudTex[g_metal.activeHudIdx];
     pthread_mutex_unlock(&g_metal.tex_lock);
 
-    double t_nd0 = CACurrentMediaTime();
     id<CAMetalDrawable> drawable = [self.metalLayer nextDrawable];
-    g_sum_nd += (CACurrentMediaTime() - t_nd0) * 1000.0;
-    if (!drawable) return;
+    if (!drawable) {
+        pthread_mutex_unlock(&g_metal.render_lock);
+        return;
+    }
 
     double t_render_start = CACurrentMediaTime();
 
@@ -1340,8 +1445,8 @@ static void render_hud_to_texture(void) {
         double t_presented = d.presentedTime;
         if (t_presented > 0) {
             double display_delay_ms = (t_presented - t_render_start) * 1000.0;
-            static int pres_cnt = 0;
-            if (++pres_cnt % 60 == 0) {
+            static atomic_int pres_cnt = 0;
+            if ((atomic_fetch_add(&pres_cnt, 1) + 1) % 60 == 0) {
                 printf("[mac] Metal -> Screen Glass delay: %.2f ms\n", display_delay_ms);
             }
         }
@@ -1349,6 +1454,8 @@ static void render_hud_to_texture(void) {
 
     [cmdBuf presentDrawable:drawable];
     [cmdBuf commit];
+
+    pthread_mutex_unlock(&g_metal.render_lock);
 }
 
 @end
@@ -1363,6 +1470,30 @@ static void render_hud_to_texture(void) {
 - (void)toggleFullscreenMode;
 - (void)updateCursorVisibility;
 @end
+
+static bool handle_sim_key(unsigned short code, bool down) {
+    bool handled = true;
+    pthread_mutex_lock(&g_ctrl_lock);
+    switch (code) {
+        case kVK_ANSI_W:     g_keys.throttle_up   = down; break;
+        case kVK_ANSI_S:     g_keys.throttle_down = down; break;
+        case kVK_ANSI_A:     g_keys.yaw_left      = down; break;
+        case kVK_ANSI_D:     g_keys.yaw_right     = down; break;
+
+        case kVK_UpArrow:    g_keys.pitch_down    = down; break;
+        case kVK_DownArrow:  g_keys.pitch_up      = down; break;
+        case kVK_LeftArrow:  g_keys.roll_left     = down; break;
+        case kVK_RightArrow: g_keys.roll_right    = down; break;
+
+        case kVK_ANSI_J:     g_keys.cam_pan_left  = down; break;
+        case kVK_ANSI_L:     g_keys.cam_pan_right = down; break;
+        case kVK_ANSI_I:     g_keys.cam_tilt_up   = down; break;
+        case kVK_ANSI_K:     g_keys.cam_tilt_down = down; break;
+        default:             handled = false; break;
+    }
+    pthread_mutex_unlock(&g_ctrl_lock);
+    return handled;
+}
 
 @implementation FullscreenWindow
 
@@ -1390,7 +1521,9 @@ static void render_hud_to_texture(void) {
 
 - (void)resignKeyWindow {
     [super resignKeyWindow];
+    pthread_mutex_lock(&g_ctrl_lock);
     memset(&g_keys, 0, sizeof(g_keys));
+    pthread_mutex_unlock(&g_ctrl_lock);
     [self updateCursorVisibility];
 }
 
@@ -1415,23 +1548,9 @@ static void render_hud_to_texture(void) {
 - (void)keyDown:(NSEvent *)event {
     if ([event isARepeat]) return;
     unsigned short code = [event keyCode];
+    if (handle_sim_key(code, true)) return;
 
     switch (code) {
-        case kVK_ANSI_W:       g_keys.throttle_up   = true; break;
-        case kVK_ANSI_S:       g_keys.throttle_down = true; break;
-        case kVK_ANSI_A:       g_keys.yaw_left      = true; break;
-        case kVK_ANSI_D:       g_keys.yaw_right     = true; break;
-
-        case kVK_UpArrow:      g_keys.pitch_down    = true; break;
-        case kVK_DownArrow:    g_keys.pitch_up      = true; break;
-        case kVK_LeftArrow:    g_keys.roll_left     = true; break;
-        case kVK_RightArrow:   g_keys.roll_right    = true; break;
-
-        case kVK_ANSI_J:       g_keys.cam_pan_left  = true; break;
-        case kVK_ANSI_L:       g_keys.cam_pan_right = true; break;
-        case kVK_ANSI_I:       g_keys.cam_tilt_up   = true; break;
-        case kVK_ANSI_K:       g_keys.cam_tilt_down = true; break;
-
         case kVK_ANSI_1: case kVK_ANSI_2: case kVK_ANSI_3: {
             pthread_mutex_lock(&g_ctrl_lock);
             g_ctrl.flight_mode = (code == kVK_ANSI_1) ? 1 : ((code == kVK_ANSI_2) ? 2 : 3);
@@ -1454,8 +1573,8 @@ static void render_hud_to_texture(void) {
             }
             break;
 
-        case kVK_ANSI_C:       ctrl_center(); break;
-        case kVK_ANSI_F:       [self toggleFullscreenMode]; break;
+        case kVK_ANSI_C: ctrl_center(); break;
+        case kVK_ANSI_F: [self toggleFullscreenMode]; break;
         case kVK_Escape:
             g_quit = 1;
             [NSApp stop:nil];
@@ -1475,24 +1594,8 @@ static void render_hud_to_texture(void) {
 }
 
 - (void)keyUp:(NSEvent *)event {
-    unsigned short code = [event keyCode];
-    switch (code) {
-        case kVK_ANSI_W:       g_keys.throttle_up   = false; break;
-        case kVK_ANSI_S:       g_keys.throttle_down = false; break;
-        case kVK_ANSI_A:       g_keys.yaw_left      = false; break;
-        case kVK_ANSI_D:       g_keys.yaw_right     = false; break;
-
-        case kVK_UpArrow:      g_keys.pitch_down    = false; break;
-        case kVK_DownArrow:    g_keys.pitch_up      = false; break;
-        case kVK_LeftArrow:    g_keys.roll_left     = false; break;
-        case kVK_RightArrow:   g_keys.roll_right    = false; break;
-
-        case kVK_ANSI_J:       g_keys.cam_pan_left  = false; break;
-        case kVK_ANSI_L:       g_keys.cam_pan_right = false; break;
-        case kVK_ANSI_I:       g_keys.cam_tilt_up   = false; break;
-        case kVK_ANSI_K:       g_keys.cam_tilt_down = false; break;
-
-        default: [super keyUp:event]; break;
+    if (!handle_sim_key([event keyCode], false)) {
+        [super keyUp:event];
     }
 }
 
@@ -1537,10 +1640,23 @@ int main(int argc, char **argv) {
         [NSApp activateIgnoringOtherApps:YES];
 
         [NSTimer scheduledTimerWithTimeInterval:0.016 repeats:YES block:^(NSTimer *timer) {
-            (void)timer;
+            if (g_quit) {
+                [timer invalidate];
+                [NSApp stop:nil];
+                [NSApp postEvent:[NSEvent otherEventWithType:NSEventTypeApplicationDefined
+                                                    location:NSZeroPoint
+                                               modifierFlags:0
+                                                   timestamp:0
+                                                windowNumber:0
+                                                     context:nil
+                                                     subtype:0
+                                                       data1:0
+                                                       data2:0] atStart:YES];
+                return;
+            }
             render_hud_to_texture();
 
-            if (now_seconds() - g_last_video_render_time > 0.020) {
+            if (now_seconds() - atomic_load(&g_last_video_render_time) > 0.020) {
                 if (g_metal_view) {
                     [g_metal_view renderFrame];
                 }
@@ -1560,6 +1676,9 @@ int main(int argc, char **argv) {
         [NSApp run];
 
         g_quit = 1;
+        pthread_mutex_lock(&g_q_lock);
+        pthread_cond_broadcast(&g_q_cond);
+        pthread_mutex_unlock(&g_q_lock);
         pthread_join(video_tid, NULL);
         pthread_join(serial_tid, NULL);
     }
