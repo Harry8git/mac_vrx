@@ -733,10 +733,14 @@ static void *decode_render_thread_fn(void *arg) {
                                 send_ret, av_err2str(send_ret), nal_end);
                     } else {
                         while (avcodec_receive_frame(dec.ctx, dec.frame) == 0) {
-                            if (dec.frame->decode_error_flags || (dec.frame->flags & AV_FRAME_FLAG_CORRUPT)) {
+                            bool is_corrupt = (dec.frame->decode_error_flags != 0) ||
+                                              ((dec.frame->flags & AV_FRAME_FLAG_CORRUPT) != 0);
+                            static bool prev_corrupt = false;
+                            if (dec.frame->decode_error_flags != 0 || (is_corrupt && !prev_corrupt)) {
                                 fprintf(stderr, "[decode] CORRUPT FRAME! err_flags=%d flags=%d pkt_size=%zu\n",
                                         dec.frame->decode_error_flags, dec.frame->flags, nal_end);
                             }
+                            prev_corrupt = is_corrupt;
                             metal_upload_yuv420p_frame(dec.frame);
                             av_frame_unref(dec.frame);
 
