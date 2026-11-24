@@ -23,9 +23,7 @@
 #include <math.h>
 #include <pthread.h>
 #include <fcntl.h>
-#include <termios.h>
 #include <errno.h>
-#include <sys/ioctl.h>
 #include <libusb-1.0/libusb.h>
 #include <libavcodec/avcodec.h>
 #include <libavutil/opt.h>
@@ -50,8 +48,6 @@
 #define MAX_AU_PAYLOAD          (2 * 1024 * 1024)
 
 /* ---------------- ArduPilot CRSF link config ---------------- */
-#define ARDUPILOT_SERIAL_DEV_DEFAULT "/dev/cu.usbmodem2103"
-#define ARDUPILOT_BAUD          B115200
 #define CRSF_TX_HZ              100
 #define SERIAL_RETRY_MS         2000
 
@@ -70,7 +66,8 @@
 
 #define SHOW_LATENCY_TIMER      1
 
-
+#define CRSF_FRAMETYPE_BARO_VARIO   0x09
+#define CRSF_FRAMETYPE_TARGET_TELEM 0x82
 
 /* ---------------- Embedded Metal Shader Source -------------- */
 static const char *kMetalShaderSource =
@@ -233,7 +230,6 @@ static void metal_upload_yuv420p_frame(AVFrame *frame) {
  * Shared State & Telemetry Structs
  * ================================================================ */
 static volatile sig_atomic_t g_quit = 0;
-static const char *g_serial_dev_path = ARDUPILOT_SERIAL_DEV_DEFAULT;
 
 static void sigint_handler(int sig) { (void)sig; g_quit = 1; }
 
@@ -294,6 +290,11 @@ typedef struct {
     float    gps_heading_deg;
     uint8_t  sats;
     char     flight_mode[16];
+    // Target Tracking Telemetry (0x82): (0,0) = hide
+    bool   target_visible;
+    float  target_x_norm;     // 0.0 .. 1.0 (top-left origin)
+    float  target_y_norm;     // 0.0 .. 1.0 (top-left origin)
+    double target_rx_time;
 } telem_data_t;
 
 static telem_data_t    g_telem = { .flight_mode = "MANUAL" };
@@ -446,7 +447,17 @@ static void handle_crsf_frame(const uint8_t *f, int len) {
             }
         }
         break;
-    }
+    case CRSF_FRAMETYPE_TARGET_TELEM:
+        if (payload_len >= 4) {
+            uint16_t raw_x = ((uint16_t)payload[0] << 8) | payload[1];
+            uint16_t raw_y = ((uint16_t)payload[2] << 8) | payload[3];
+            g_telem.target_visible = !(raw_x == 0 && raw_y == 0);
+            g_telem.target_x_norm  = (float)raw_x / 65535.0f;
+            g_telem.target_y_norm  = (float)raw_y / 65535.0f;
+            g_telem.target_rx_time = now_seconds();
+        }
+        break;
+    } // <-- closes switch (type)
     pthread_mutex_unlock(&g_telem_lock);
 }
 
@@ -769,9 +780,25 @@ static void *decode_render_thread_fn(void *arg) {
 }
 
 /* ================================================================
- * Video Thread: High-Speed Dedicated USB Ingest
+ * Unified USB Vendor Supervisor (Video 0xFF/0x00 + CRSF 0xFF/0x01)
  * ================================================================ */
-static bool find_bulk_in_endpoint(libusb_device *dev, int *out_intf, uint8_t *out_ep) {
+typedef struct {
+    libusb_device_handle *dev;
+    int     video_intf;
+    uint8_t video_ep_in;
+    bool    has_video;
+
+    int     crsf_intf;
+    uint8_t crsf_ep_in;
+    uint8_t crsf_ep_out;
+    bool    has_crsf;
+
+    _Atomic bool stop;
+    _Atomic bool disconnected;
+} usb_session_t;
+
+static bool find_vendor_endpoints(libusb_device *dev, uint8_t target_subclass,
+                                  int *out_intf, uint8_t *out_ep_in, uint8_t *out_ep_out) {
     struct libusb_config_descriptor *config = NULL;
     if (libusb_get_active_config_descriptor(dev, &config) < 0) return false;
 
@@ -780,18 +807,29 @@ static bool find_bulk_in_endpoint(libusb_device *dev, int *out_intf, uint8_t *ou
         const struct libusb_interface *intf = &config->interface[i];
         for (int a = 0; a < intf->num_altsetting && !found; a++) {
             const struct libusb_interface_descriptor *alt = &intf->altsetting[a];
-            if (alt->bInterfaceClass != LIBUSB_CLASS_VENDOR_SPEC) continue;
+            if (alt->bInterfaceClass != LIBUSB_CLASS_VENDOR_SPEC ||
+                alt->bInterfaceSubClass != target_subclass) {
+                continue;
+            }
 
+            uint8_t ep_in = 0, ep_out = 0;
             for (int e = 0; e < alt->bNumEndpoints; e++) {
                 const struct libusb_endpoint_descriptor *ep = &alt->endpoint[e];
-                bool is_in = (ep->bEndpointAddress & LIBUSB_ENDPOINT_DIR_MASK) == LIBUSB_ENDPOINT_IN;
-                bool is_bulk = (ep->bmAttributes & LIBUSB_TRANSFER_TYPE_MASK) == LIBUSB_TRANSFER_TYPE_BULK;
-                if (is_in && is_bulk) {
-                    *out_intf = alt->bInterfaceNumber;
-                    *out_ep   = ep->bEndpointAddress;
-                    found = true;
-                    break;
+                uint8_t xfer = ep->bmAttributes & LIBUSB_TRANSFER_TYPE_MASK;
+                if (xfer != LIBUSB_TRANSFER_TYPE_BULK && xfer != LIBUSB_TRANSFER_TYPE_INTERRUPT) continue;
+
+                if ((ep->bEndpointAddress & LIBUSB_ENDPOINT_DIR_MASK) == LIBUSB_ENDPOINT_IN) {
+                    if (!ep_in) ep_in = ep->bEndpointAddress;
+                } else {
+                    if (!ep_out) ep_out = ep->bEndpointAddress;
                 }
+            }
+
+            if (ep_in && (!out_ep_out || ep_out)) {
+                *out_intf   = alt->bInterfaceNumber;
+                *out_ep_in  = ep_in;
+                if (out_ep_out) *out_ep_out = ep_out;
+                found = true;
             }
         }
     }
@@ -799,143 +837,75 @@ static bool find_bulk_in_endpoint(libusb_device *dev, int *out_intf, uint8_t *ou
     return found;
 }
 
-static void *video_thread_fn(void *arg) {
-    (void)arg;
-    libusb_context *ctx = NULL;
-    if (libusb_init(&ctx) < 0) return NULL;
-
+static void *video_rx_worker(void *arg) {
+    usb_session_t *s = (usb_session_t *)arg;
     uint8_t *usb_buffer = malloc(BUFFER_SIZE);
+    if (!usb_buffer) return NULL;
 
-    pthread_t dec_tid;
-    pthread_create(&dec_tid, NULL, decode_render_thread_fn, NULL);
+    while (!g_quit && !atomic_load(&s->stop)) {
+        int actual = 0;
+        int ret = libusb_bulk_transfer(s->dev, s->video_ep_in, usb_buffer, BUFFER_SIZE, &actual, 100);
 
-    while (!g_quit) {
-        libusb_device_handle *dev = libusb_open_device_with_vid_pid(ctx, TARGET_VID, TARGET_PID);
-        if (!dev) {
-            usleep(200 * 1000);
-            continue;
+        static double last_print = 0;
+        double now = now_seconds();
+        if (now - last_print >= 1.0) {
+            last_print = now;
+            fprintf(stderr, "[libusb] video ret=%d (%s), actual=%d bytes\n",
+                    ret, libusb_error_name(ret), actual);
         }
 
-        int target_intf = -1;
-        uint8_t ep_in_addr = 0;
-        if (!find_bulk_in_endpoint(libusb_get_device(dev), &target_intf, &ep_in_addr)) {
-            libusb_close(dev);
-            usleep(500 * 1000);
-            continue;
-        }
-
-        libusb_detach_kernel_driver(dev, target_intf);
-        if (libusb_claim_interface(dev, target_intf) < 0) {
-            libusb_close(dev);
-            usleep(500 * 1000);
-            continue;
-        }
-
-        fprintf(stderr, "[video] Connected! EP 0x%02X streaming\n", ep_in_addr);
-
-        while (!g_quit) {
-            int actual = 0;
-            int ret = libusb_bulk_transfer(dev, ep_in_addr, usb_buffer, BUFFER_SIZE, &actual, 100);
-
-            static double last_print = 0;
-            double now = now_seconds();
-            if (now - last_print >= 1.0) {
-                last_print = now;
-                fprintf(stderr, "[libusb] bulk_transfer ret=%d (%s), actual=%d bytes\n",
-                        ret, libusb_error_name(ret), actual);
-            }
-
-            if ((ret == 0 || ret == LIBUSB_ERROR_TIMEOUT) && actual > 0) {
-                if (ret == LIBUSB_ERROR_TIMEOUT) {
-                    fprintf(stderr, "[video] WARNING: libusb timeout with %d partial bytes!\n", actual);
+        if ((ret == 0 || ret == LIBUSB_ERROR_TIMEOUT) && actual > 0) {
+            pthread_mutex_lock(&g_q_lock);
+            if (g_q_count >= 20) {
+                while (g_q_count >= 20) {
+                    g_q_tail = (g_q_tail + 1) % QUEUE_CAP;
+                    g_q_count--;
                 }
-                pthread_mutex_lock(&g_q_lock);
-                if (g_q_count >= 20) {
-                    int dropped = 0;
-                    while (g_q_count >= 20) {
-                        g_q_tail = (g_q_tail + 1) % QUEUE_CAP;
-                        g_q_count--;
-                        dropped++;
-                    }
-                    fprintf(stderr, "[video] WARNING: decode queue overflow, dropped %d chunk(s)\n", dropped);
-                }
-
-                uint32_t copy_len = (actual > QUEUE_SLOT_SIZE) ? QUEUE_SLOT_SIZE : (uint32_t)actual;
-                memcpy(g_queue[g_q_head].data, usb_buffer, copy_len);
-                g_queue[g_q_head].len = copy_len;
-                g_q_head = (g_q_head + 1) % QUEUE_CAP;
-                g_q_count++;
-                pthread_cond_signal(&g_q_cond);
-                pthread_mutex_unlock(&g_q_lock);
-            } else if (ret == LIBUSB_ERROR_NO_DEVICE || ret == LIBUSB_ERROR_IO) {
-                fprintf(stderr, "[video] Device disconnected\n");
-                break;
             }
+            uint32_t copy_len = (actual > QUEUE_SLOT_SIZE) ? QUEUE_SLOT_SIZE : (uint32_t)actual;
+            memcpy(g_queue[g_q_head].data, usb_buffer, copy_len);
+            g_queue[g_q_head].len = copy_len;
+            g_q_head = (g_q_head + 1) % QUEUE_CAP;
+            g_q_count++;
+            pthread_cond_signal(&g_q_cond);
+            pthread_mutex_unlock(&g_q_lock);
+        } else if (ret == LIBUSB_ERROR_NO_DEVICE || ret == LIBUSB_ERROR_IO) {
+            atomic_store(&s->disconnected, true);
+            break;
         }
-
-        libusb_release_interface(dev, target_intf);
-        libusb_close(dev);
     }
 
-    g_quit = 1;
-    pthread_mutex_lock(&g_q_lock);
-    pthread_cond_broadcast(&g_q_cond);
-    pthread_mutex_unlock(&g_q_lock);
-    pthread_join(dec_tid, NULL);
-
     free(usb_buffer);
-    libusb_exit(ctx);
     return NULL;
 }
 
-/* ================================================================
- * Serial Thread: 100 Hz Physics + CRSF I/O
- * ================================================================ */
-static void *serial_thread_fn(void *arg) {
-    (void)arg;
+static void *crsf_rx_worker(void *arg) {
+    usb_session_t *s = (usb_session_t *)arg;
     crsf_parser_t parser = {0};
-    int fd = -1;
-    double last_tx_t = now_seconds();
+    uint8_t rx_buf[128];
+
+    while (!g_quit && !atomic_load(&s->stop)) {
+        int actual = 0;
+        int ret = libusb_bulk_transfer(s->dev, s->crsf_ep_in, rx_buf, sizeof(rx_buf), &actual, 100);
+        if ((ret == 0 || ret == LIBUSB_ERROR_TIMEOUT) && actual > 0) {
+            for (int i = 0; i < actual; i++) {
+                crsf_parser_feed(&parser, rx_buf[i]);
+            }
+        } else if (ret == LIBUSB_ERROR_NO_DEVICE || ret == LIBUSB_ERROR_IO) {
+            atomic_store(&s->disconnected, true);
+            break;
+        }
+    }
+    return NULL;
+}
+
+static void *crsf_tx_worker(void *arg) {
+    usb_session_t *s = (usb_session_t *)arg;
+    double last_tx_t      = now_seconds();
     double last_physics_t = now_seconds();
 
-    while (!g_quit) {
-        if (fd < 0) {
-            fd = open(g_serial_dev_path, O_RDWR | O_NOCTTY | O_NONBLOCK);
-            if (fd < 0) {
-                usleep(SERIAL_RETRY_MS * 1000);
-                continue;
-            }
-            struct termios tty;
-            memset(&tty, 0, sizeof(tty));
-            if (tcgetattr(fd, &tty) == 0) {
-                cfsetspeed(&tty, ARDUPILOT_BAUD);
-                tty.c_cflag |= (CLOCAL | CREAD | CS8);
-                tty.c_cflag &= ~(PARENB | CSTOPB | CRTSCTS);
-                tty.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);
-                tty.c_iflag &= ~(IXON | IXOFF | IXANY);
-                tty.c_oflag &= ~OPOST;
-                tty.c_cc[VMIN]  = 1;
-                tty.c_cc[VTIME] = 0;
-                tcsetattr(fd, TCSANOW, &tty);
-                int modem_ctrl = TIOCM_DTR | TIOCM_RTS;
-                ioctl(fd, TIOCMBIS, &modem_ctrl);
-            }
-            fprintf(stderr, "[serial] Connected to %s\n", g_serial_dev_path);
-        }
-
-        uint8_t rx_buf[256];
-        ssize_t n;
-        while ((n = read(fd, rx_buf, sizeof(rx_buf))) > 0) {
-            for (ssize_t i = 0; i < n; i++) crsf_parser_feed(&parser, rx_buf[i]);
-        }
-        if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
-            fprintf(stderr, "[serial] Disconnected from %s\n", g_serial_dev_path);
-            close(fd);
-            fd = -1;
-            continue;
-        }
-
-        double t = now_seconds();
+    while (!g_quit && !atomic_load(&s->stop)) {
+        double t  = now_seconds();
         double dt = t - last_physics_t;
         if (dt >= 0.01) {
             float blend = 1.0f - expf((float)(-dt / DECAY_TAU_SEC));
@@ -953,10 +923,10 @@ static void *serial_thread_fn(void *arg) {
             if (g_keys.throttle_down) g_ctrl.throttle = clampf(g_ctrl.throttle - THROTTLE_RATE * (float)dt, 0.0f, 1.0f);
 
             float cam_speed = 1.5f;
-            if (g_keys.cam_pan_left)   g_ctrl.cam_pan  = clampf(g_ctrl.cam_pan  - cam_speed * (float)dt, -1.0f, 1.0f);
-            if (g_keys.cam_pan_right)  g_ctrl.cam_pan  = clampf(g_ctrl.cam_pan  + cam_speed * (float)dt, -1.0f, 1.0f);
-            if (g_keys.cam_tilt_down)  g_ctrl.cam_tilt = clampf(g_ctrl.cam_tilt - cam_speed * (float)dt, -1.0f, 1.0f);
-            if (g_keys.cam_tilt_up)    g_ctrl.cam_tilt = clampf(g_ctrl.cam_tilt + cam_speed * (float)dt, -1.0f, 1.0f);
+            if (g_keys.cam_pan_left)  g_ctrl.cam_pan  = clampf(g_ctrl.cam_pan  - cam_speed * (float)dt, -1.0f, 1.0f);
+            if (g_keys.cam_pan_right) g_ctrl.cam_pan  = clampf(g_ctrl.cam_pan  + cam_speed * (float)dt, -1.0f, 1.0f);
+            if (g_keys.cam_tilt_down) g_ctrl.cam_tilt = clampf(g_ctrl.cam_tilt - cam_speed * (float)dt, -1.0f, 1.0f);
+            if (g_keys.cam_tilt_up)   g_ctrl.cam_tilt = clampf(g_ctrl.cam_tilt + cam_speed * (float)dt, -1.0f, 1.0f);
             pthread_mutex_unlock(&g_ctrl_lock);
 
             last_physics_t = t;
@@ -970,19 +940,93 @@ static void *serial_thread_fn(void *arg) {
 
             uint8_t tx_frame[26];
             int len = crsf_build_rc_frame(current, tx_frame);
-            ssize_t wn = write(fd, tx_frame, len);
-            if (wn < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-                fprintf(stderr, "[serial] Write error (%s), disconnecting\n", strerror(errno));
-                close(fd);
-                fd = -1;
-                continue;
+            int actual = 0;
+            int ret = libusb_bulk_transfer(s->dev, s->crsf_ep_out, tx_frame, len, &actual, 50);
+            if (ret == LIBUSB_ERROR_NO_DEVICE || ret == LIBUSB_ERROR_IO) {
+                atomic_store(&s->disconnected, true);
+                break;
             }
         }
 
         usleep(1000);
     }
+    return NULL;
+}
 
-    if (fd >= 0) close(fd);
+static void *usb_supervisor_thread_fn(void *arg) {
+    (void)arg;
+    libusb_context *ctx = NULL;
+    if (libusb_init(&ctx) < 0) return NULL;
+
+    pthread_t dec_tid;
+    pthread_create(&dec_tid, NULL, decode_render_thread_fn, NULL);
+
+    while (!g_quit) {
+        libusb_device_handle *dev = libusb_open_device_with_vid_pid(ctx, TARGET_VID, TARGET_PID);
+        if (!dev) {
+            usleep(200 * 1000);
+            continue;
+        }
+
+        usb_session_t sess = {0};
+        sess.dev = dev;
+        libusb_device *udev = libusb_get_device(dev);
+
+        if (find_vendor_endpoints(udev, 0x00, &sess.video_intf, &sess.video_ep_in, NULL)) {
+            libusb_detach_kernel_driver(dev, sess.video_intf);
+            if (libusb_claim_interface(dev, sess.video_intf) == 0) {
+                sess.has_video = true;
+            }
+        }
+
+        if (find_vendor_endpoints(udev, 0x01, &sess.crsf_intf, &sess.crsf_ep_in, &sess.crsf_ep_out)) {
+            libusb_detach_kernel_driver(dev, sess.crsf_intf);
+            if (libusb_claim_interface(dev, sess.crsf_intf) == 0) {
+                sess.has_crsf = true;
+            }
+        }
+
+        if (!sess.has_video && !sess.has_crsf) {
+            libusb_close(dev);
+            usleep(500 * 1000);
+            continue;
+        }
+
+        fprintf(stderr, "[usb] Connected! video=%s (ep 0x%02X), crsf=%s (in 0x%02X, out 0x%02X)\n",
+                sess.has_video ? "ON" : "OFF", sess.video_ep_in,
+                sess.has_crsf  ? "ON" : "OFF", sess.crsf_ep_in, sess.crsf_ep_out);
+
+        pthread_t th_vid = 0, th_crx = 0, th_ctx = 0;
+        if (sess.has_video) pthread_create(&th_vid, NULL, video_rx_worker, &sess);
+        if (sess.has_crsf) {
+            pthread_create(&th_crx, NULL, crsf_rx_worker, &sess);
+            pthread_create(&th_ctx, NULL, crsf_tx_worker, &sess);
+        }
+
+        while (!g_quit && !atomic_load(&sess.disconnected)) {
+            usleep(50 * 1000);
+        }
+
+        fprintf(stderr, "[usb] Disconnecting workers...\n");
+        atomic_store(&sess.stop, true);
+        if (sess.has_video) pthread_join(th_vid, NULL);
+        if (sess.has_crsf) {
+            pthread_join(th_crx, NULL);
+            pthread_join(th_ctx, NULL);
+        }
+
+        if (sess.has_video) libusb_release_interface(dev, sess.video_intf);
+        if (sess.has_crsf)  libusb_release_interface(dev, sess.crsf_intf);
+        libusb_close(dev);
+    }
+
+    g_quit = 1;
+    pthread_mutex_lock(&g_q_lock);
+    pthread_cond_broadcast(&g_q_cond);
+    pthread_mutex_unlock(&g_q_lock);
+    pthread_join(dec_tid, NULL);
+
+    libusb_exit(ctx);
     return NULL;
 }
 
@@ -1341,6 +1385,22 @@ static void render_hud_to_texture(void) {
     CGSize navSize = [osdNav sizeWithAttributes:attrPri];
     [osdNav drawAtPoint:CGPointMake(w - navSize.width - 36, 20) withAttributes:attrPri];
 
+    /* 7. Visual Target Lock Crosshair (0x82) */
+    if (telem.target_visible && (t_now - telem.target_rx_time) < 0.5) {
+        CGFloat tx  = telem.target_x_norm * w;
+        CGFloat ty  = (1.0f - telem.target_y_norm) * h; // Flip Y (CGContext origin is bottom-left)
+        CGFloat gap = 0;
+        CGFloat arm = 10.0;
+
+        CGContextBeginPath(ctx);
+        CGContextMoveToPoint(ctx, tx - arm, ty); CGContextAddLineToPoint(ctx, tx - gap, ty);
+        CGContextMoveToPoint(ctx, tx + gap, ty); CGContextAddLineToPoint(ctx, tx + arm, ty);
+        CGContextMoveToPoint(ctx, tx, ty - arm); CGContextAddLineToPoint(ctx, tx, ty - gap);
+        CGContextMoveToPoint(ctx, tx, ty + gap); CGContextAddLineToPoint(ctx, tx, ty + arm);
+        hud_stroke_backed(ctx, cgPri, cgShad, 1.8);
+    }
+
+
     [NSGraphicsContext restoreGraphicsState];
     CGContextRestoreGState(ctx);
 
@@ -1620,7 +1680,7 @@ static bool handle_sim_key(unsigned short code, bool down) {
  * Main Application Entry Point
  * ================================================================ */
 int main(int argc, char **argv) {
-    if (argc > 1) g_serial_dev_path = argv[1];
+    (void)argc; (void)argv;
 
     signal(SIGINT, sigint_handler);
     signal(SIGTERM, sigint_handler);
@@ -1678,15 +1738,14 @@ int main(int argc, char **argv) {
             }
         }];
 
-        pthread_t video_tid, serial_tid;
-        pthread_create(&video_tid, NULL, video_thread_fn, NULL);
-        pthread_create(&serial_tid, NULL, serial_thread_fn, NULL);
+        pthread_t usb_tid;
+        pthread_create(&usb_tid, NULL, usb_supervisor_thread_fn, NULL);
 
         fprintf(stderr,
             "\n==================================================\n"
             " ArduPilot FPV Controller & Metal HUD Ready \n"
             "==================================================\n"
-            " Port: %s\n\n", g_serial_dev_path);
+            " USB Vendor Bridge: 0x%04X:0x%04X\n\n", TARGET_VID, TARGET_PID);
 
         [NSApp run];
 
@@ -1694,8 +1753,7 @@ int main(int argc, char **argv) {
         pthread_mutex_lock(&g_q_lock);
         pthread_cond_broadcast(&g_q_cond);
         pthread_mutex_unlock(&g_q_lock);
-        pthread_join(video_tid, NULL);
-        pthread_join(serial_tid, NULL);
+        pthread_join(usb_tid, NULL);
     }
     return 0;
 }
