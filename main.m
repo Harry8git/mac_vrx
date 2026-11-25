@@ -60,14 +60,15 @@
 #define CRSF_FRAMETYPE_ATTITUDE 0x1E
 #define CRSF_FRAMETYPE_FLIGHT_MODE 0x21
 #define CRSF_FRAMETYPE_BARO_VARIO 0x09
+#define CRSF_FRAMETYPE_TARGET_TELEM 0x82
+#define CRSF_FRAMETYPE_TARGET_CMD 0x81
 
 #define DECAY_TAU_SEC           0.35f
 #define THROTTLE_RATE           0.50f
 
-#define SHOW_LATENCY_TIMER      1
+#define SHOW_LATENCY_TIMER      0
 
-#define CRSF_FRAMETYPE_BARO_VARIO   0x09
-#define CRSF_FRAMETYPE_TARGET_TELEM 0x82
+
 
 /* ---------------- Embedded Metal Shader Source -------------- */
 static const char *kMetalShaderSource =
@@ -352,6 +353,32 @@ static void crsf_pack_channels(const uint16_t ch[16], uint8_t out[22]) {
             bitcount -= 8;
         }
     }
+}
+
+static uint16_t g_click_x = 0, g_click_y = 0;
+static uint8_t  g_click_seq = 0;
+static int      g_click_repeats = 0;
+
+static void queue_target_click(uint16_t raw_x, uint16_t raw_y) {
+    pthread_mutex_lock(&g_ctrl_lock);
+    g_click_x = raw_x;
+    g_click_y = raw_y;
+    g_click_seq++;
+    g_click_repeats = 3; // Send 3x over 30ms for RF reliability
+    pthread_mutex_unlock(&g_ctrl_lock);
+}
+
+static int crsf_build_target_cmd_frame(uint16_t x, uint16_t y, uint8_t seq, uint8_t out[9]) {
+    out[0] = CRSF_SYNC_FC;
+    out[1] = 7; // type(1) + payload(5) + crc(1)
+    out[2] = CRSF_FRAMETYPE_TARGET_CMD;
+    out[3] = (uint8_t)(x >> 8);
+    out[4] = (uint8_t)(x & 0xFF);
+    out[5] = (uint8_t)(y >> 8);
+    out[6] = (uint8_t)(y & 0xFF);
+    out[7] = seq;
+    out[8] = crsf_crc8(&out[2], 6);
+    return 9;
 }
 
 static int crsf_build_rc_frame(ctrl_state_t s, uint8_t out[26]) {
@@ -945,6 +972,25 @@ static void *crsf_tx_worker(void *arg) {
             if (ret == LIBUSB_ERROR_NO_DEVICE || ret == LIBUSB_ERROR_IO) {
                 atomic_store(&s->disconnected, true);
                 break;
+            }
+
+            uint16_t cx = 0, cy = 0;
+            uint8_t  cseq = 0;
+            bool     send_click = false;
+            pthread_mutex_lock(&g_ctrl_lock);
+            if (g_click_repeats > 0) {
+                cx = g_click_x; cy = g_click_y; cseq = g_click_seq;
+                g_click_repeats--;
+                send_click = true;
+            }
+            pthread_mutex_unlock(&g_ctrl_lock);
+
+            if (send_click) {
+                uint8_t cmd_frame[9];
+                int clen = crsf_build_target_cmd_frame(cx, cy, cseq, cmd_frame);
+                int cret = libusb_bulk_transfer(s->dev, s->crsf_ep_out, cmd_frame, clen, &actual, 50);
+                fprintf(stderr, "[mac] USB TX 0x81 ret=%d (%s) actual=%d\n",
+                        cret, libusb_error_name(cret), actual);
             }
         }
 
@@ -1541,6 +1587,7 @@ static void render_hud_to_texture(void) {
 @interface FullscreenWindow : NSWindow
 @property (nonatomic, assign) BOOL isFullscreen;
 @property (nonatomic, assign) BOOL cursorHidden;
+@property (nonatomic, assign) BOOL targetCursorMode;
 @property (nonatomic, assign) NSRect savedWindowedRect;
 - (void)toggleFullscreenMode;
 - (void)updateCursorVisibility;
@@ -1576,17 +1623,37 @@ static bool handle_sim_key(unsigned short code, bool down) {
 - (BOOL)canBecomeMainWindow { return YES; }
 
 - (void)updateCursorVisibility {
-    if (self.isFullscreen && [self isKeyWindow]) {
-        if (!self.cursorHidden) {
-            [NSCursor hide];
-            self.cursorHidden = YES;
-        }
+    if (self.isFullscreen && [self isKeyWindow] && !self.targetCursorMode) {
+        if (!self.cursorHidden) { [NSCursor hide]; self.cursorHidden = YES; }
     } else {
-        if (self.cursorHidden) {
-            [NSCursor unhide];
-            self.cursorHidden = NO;
-        }
+        if (self.cursorHidden) { [NSCursor unhide]; self.cursorHidden = NO; }
     }
+}
+
+- (void)mouseDown:(NSEvent *)event {
+    if (!g_metal_view) return;
+    NSPoint pt = [g_metal_view convertPoint:[event locationInWindow] fromView:nil];
+    NSSize  sz = g_metal_view.bounds.size;
+    if (sz.width <= 0 || sz.height <= 0) return;
+
+    float nx = clampf((float)(pt.x / sz.width), 0.0f, 1.0f);
+    float ny = clampf(1.0f - (float)(pt.y / sz.height), 0.0f, 1.0f); // Flip Cocoa Y
+    uint16_t rx = (uint16_t)lroundf(nx * 65535.0f);
+    uint16_t ry = (uint16_t)lroundf(ny * 65535.0f);
+    if (rx == 0 && ry == 0) rx = 1;
+
+    fprintf(stderr, "[mac] mouseDown -> queue click rx=%u, ry=%u\n", rx, ry);
+    queue_target_click(rx, ry);
+
+    if (self.targetCursorMode) {
+        self.targetCursorMode = NO;
+        [self updateCursorVisibility];
+    }
+}
+
+- (void)rightMouseDown:(NSEvent *)event {
+    (void)event;
+    queue_target_click(0, 0);
 }
 
 - (void)becomeKeyWindow {
@@ -1663,6 +1730,14 @@ static bool handle_sim_key(unsigned short code, bool down) {
                                                    data1:0
                                                    data2:0] atStart:YES];
             break;
+        case kVK_ANSI_T:
+         self.targetCursorMode = !self.targetCursorMode;
+         [self updateCursorVisibility];
+         break;
+
+     case kVK_ANSI_X:
+         queue_target_click(0, 0);
+         break;
 
         default: [super keyDown:event]; break;
     }
